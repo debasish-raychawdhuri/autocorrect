@@ -1,6 +1,7 @@
 # Track model files with Git LFS
 *.pt filter=lfs diff=lfs merge=lfs -text
 *.bin filter=lfs diff=lfs merge=lfs -text
+# Track large data files with Git LFS
 autogen_char_data.json filter=lfs diff=lfs merge=lfs -text
 error_samples.jsonl filter=lfs diff=lfs merge=lfs -text
 prefix_samples.txt filter=lfs diff=lfs merge=lfs -text
