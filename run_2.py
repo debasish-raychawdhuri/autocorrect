@@ -8,6 +8,7 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import string
 import os
+import time
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"✅ Using device: {device}")
@@ -291,9 +292,15 @@ if __name__ == "__main__":
                 context = input("> ").strip().split()
                 print("Enter misspelled word:")
                 misspelled = input("> ").strip()
+                
+                # Start timing after input is entered
+                start_time = time.time()
                 predictions = predict_word(model, w2v_model, char_to_id, id_to_char, context, misspelled,
                                            max_word_len=args.max_word_len, max_gen_len=args.max_gen_len, ctx_len=args.ctx_len)
-                print("Top 10 predictions:")
+                end_time = time.time()
+                
+                prediction_time = end_time - start_time
+                print(f"\nTop 10 predictions (computed in {prediction_time:.3f} seconds):")
                 for i, (word, log_prob) in enumerate(predictions, 1):
                     print(f"{i:2d}. {word} (log_prob: {log_prob:.3f})")
         except KeyboardInterrupt:
