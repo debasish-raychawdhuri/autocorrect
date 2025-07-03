@@ -140,21 +140,56 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
         torch.save(model.state_dict(), save_path)
 
 def predict_word(model, w2v_model, char_to_id, id_to_char, context_words, misspelled_word,
-                 max_word_len=30, max_gen_len=50, ctx_len=10, max_output_len=30):
+                 max_word_len=30, max_gen_len=50, ctx_len=10, max_output_len=30, beam_width=10):
     model.eval()
     with torch.no_grad():
-        generated = ""
+        # Initialize beam with empty sequence
+        beams = [(0.0, "")]  # (log_prob, sequence)
+        
         for i in range(max_output_len):
-            context_vec = torch.tensor([vectorize_context(context_words, w2v_model, ctx_len)], dtype=torch.float32).to(device)
-            misspelled_oh = torch.tensor([one_hot_chars(misspelled_word, char_to_id, max_word_len)], dtype=torch.float32).to(device)
-            prefix_oh = torch.tensor([one_hot_chars(generated, char_to_id, max_gen_len)], dtype=torch.float32).to(device)
-            logits = model(context_vec, misspelled_oh, prefix_oh)
-            pred_id = logits.argmax(dim=1).item()
-            pred_char = id_to_char[pred_id]
-            if pred_char == "<eow>":
+            candidates = []
+            
+            for log_prob, sequence in beams:
+                # If sequence is complete, keep it as is
+                if sequence.endswith("<eow>") or len(sequence) >= max_output_len:
+                    candidates.append((log_prob, sequence))
+                    continue
+                
+                # Get predictions for this sequence
+                context_vec = torch.tensor([vectorize_context(context_words, w2v_model, ctx_len)], dtype=torch.float32).to(device)
+                misspelled_oh = torch.tensor([one_hot_chars(misspelled_word, char_to_id, max_word_len)], dtype=torch.float32).to(device)
+                prefix_oh = torch.tensor([one_hot_chars(sequence, char_to_id, max_gen_len)], dtype=torch.float32).to(device)
+                
+                logits = model(context_vec, misspelled_oh, prefix_oh)
+                log_probs = F.log_softmax(logits, dim=1).squeeze()
+                
+                # Get top beam_width candidates
+                top_k = torch.topk(log_probs, beam_width)
+                
+                for j in range(beam_width):
+                    char_id = top_k.indices[j].item()
+                    char_log_prob = top_k.values[j].item()
+                    pred_char = id_to_char[char_id]
+                    
+                    new_sequence = sequence + pred_char
+                    new_log_prob = log_prob + char_log_prob
+                    
+                    candidates.append((new_log_prob, new_sequence))
+            
+            # Keep top beam_width candidates
+            beams = sorted(candidates, key=lambda x: x[0], reverse=True)[:beam_width]
+            
+            # Check if all beams are complete
+            if all(seq.endswith("<eow>") for _, seq in beams):
                 break
-            generated += pred_char
-        return generated
+        
+        # Return top 10 predictions, removing <eow> marker
+        results = []
+        for log_prob, sequence in beams:
+            word = sequence.replace("<eow>", "")
+            results.append((word, log_prob))
+        
+        return results[:10]
 
 def model_matches(model, state_dict):
     """Check if the loaded state_dict fits the model structure. Print all mismatches."""
@@ -256,9 +291,11 @@ if __name__ == "__main__":
                 context = input("> ").strip().split()
                 print("Enter misspelled word:")
                 misspelled = input("> ").strip()
-                output = predict_word(model, w2v_model, char_to_id, id_to_char, context, misspelled,
-                                      max_word_len=args.max_word_len, max_gen_len=args.max_gen_len, ctx_len=args.ctx_len)
-                print("Corrected word:", output)
+                predictions = predict_word(model, w2v_model, char_to_id, id_to_char, context, misspelled,
+                                           max_word_len=args.max_word_len, max_gen_len=args.max_gen_len, ctx_len=args.ctx_len)
+                print("Top 10 predictions:")
+                for i, (word, log_prob) in enumerate(predictions, 1):
+                    print(f"{i:2d}. {word} (log_prob: {log_prob:.3f})")
         except KeyboardInterrupt:
             print("\nExiting...")
 
