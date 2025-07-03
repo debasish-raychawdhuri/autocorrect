@@ -1,0 +1,25 @@
+# Virtual environments
+venv/
+venv11/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+pip-log.txt
+pip-delete-this-directory.txt
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large data files (if you don't want to track them)
+GoogleNews-vectors-negative300.bin
