@@ -208,20 +208,6 @@ class CharGenLazyDataset(Dataset):
             print(f"⚠️ Failed to save index: {e}")
         
         print(f"✅ Dataset ready: {self.total_samples:,} samples from {len(self.offsets):,} original samples")
-            
-            # Create progress bar for indexing
-            pbar = tqdm(total=total_lines, desc="Indexing samples", unit="samples")
-            
-            for line_idx, line in enumerate(f):
-                self.offsets.append(pos)
-                pos += len(line.encode("utf-8"))
-                
-                # Count how many prefix samples this line will generate
-                sample = json.loads(line.strip())
-                target = sample["target"]
-                prefix_count = len(target) + 1  # +1 for the <eow> case
-                self.sample_lengths.append(prefix_count)
-                total_expanded_samples += prefix_count
                 
                 # Update progress bar
                 pbar.update(1)
