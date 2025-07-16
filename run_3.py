@@ -410,13 +410,15 @@ class CharGenLazyDataset(Dataset):
         self.sample_lengths = []
         self.cumulative_lengths = []
         
-        # First load the entire index in the main process
-        print("Loading index data in main process...")
-        index_data = torch.load(index_path, map_location='cpu')
-        total_samples = index_data['total_samples']
-        offsets_size = len(index_data['offsets'])
-        
-        print(f"Index contains {offsets_size:,} samples, {total_samples:,} expanded samples")
+        # First load just the metadata to get sizes
+        print("Loading index metadata...")
+        with open(index_path, 'rb') as f:
+            metadata = torch.load(f, map_location='cpu')
+            total_samples = metadata['total_samples']
+            offsets_size = len(metadata['offsets'])
+            print(f"Index contains {offsets_size:,} samples, {total_samples:,} expanded samples")
+            # Free memory
+            del metadata
         
         # Calculate chunk sizes for processing
         num_chunks = self.num_workers
@@ -447,28 +449,10 @@ class CharGenLazyDataset(Dataset):
                 if start_idx >= end_idx:
                     continue
                 
-                # Create process arguments - only pass the necessary data
-                chunk_data = {
-                    'offsets': index_data['offsets'][start_idx:end_idx],
-                    'sample_lengths': index_data['sample_lengths'][start_idx:end_idx],
-                    'cumulative_lengths': None
-                }
-                
-                # Handle cumulative lengths
-                if start_idx == 0:
-                    # First chunk, take as is
-                    chunk_data['cumulative_lengths'] = index_data['cumulative_lengths'][start_idx:end_idx]
-                elif start_idx < len(index_data['cumulative_lengths']):
-                    # Subsequent chunks, adjust to start from 0
-                    prev_cumulative = index_data['cumulative_lengths'][start_idx - 1]
-                    chunk_data['cumulative_lengths'] = [
-                        cl - prev_cumulative for cl in index_data['cumulative_lengths'][start_idx:end_idx]
-                    ]
-                
-                # Create and start process
+                # Create and start process - pass only indices, not actual data
                 p = mp.Process(
                     target=self._process_index_chunk,
-                    args=(i, chunk_data, result_queue),
+                    args=(i, index_path, start_idx, end_idx, result_queue),
                     daemon=True
                 )
                 
@@ -483,7 +467,7 @@ class CharGenLazyDataset(Dataset):
             results = []
             for _ in range(len(processes)):
                 try:
-                    chunk_id, offsets, sample_lengths, cumulative_lengths = result_queue.get(timeout=30)
+                    chunk_id, offsets, sample_lengths, cumulative_lengths = result_queue.get(timeout=60)
                     results.append((chunk_id, offsets, sample_lengths, cumulative_lengths))
                     overall_progress.update(len(offsets))
                 except Exception as e:
@@ -550,7 +534,7 @@ class CharGenLazyDataset(Dataset):
             raise
     
     @staticmethod
-    def _process_index_chunk(chunk_id, chunk_data, result_queue):
+    def _process_index_chunk(chunk_id, index_path, start_idx, end_idx, result_queue):
         """Process a chunk of the index data"""
         try:
             # Set lower process priority if possible
@@ -565,25 +549,48 @@ class CharGenLazyDataset(Dataset):
             
             # Print process info
             pid = os.getpid()
-            print(f"Process {pid} (chunk {chunk_id}) processing data")
-            
-            # Extract data from chunk
-            offsets = chunk_data['offsets']
-            sample_lengths = chunk_data['sample_lengths']
-            cumulative_lengths = chunk_data['cumulative_lengths']
+            print(f"Process {pid} (chunk {chunk_id}) loading data from {start_idx:,} to {end_idx:,}")
             
             # Create a progress bar
             with tqdm(
-                total=len(offsets),
+                total=100,
                 desc=f"Chunk {chunk_id}",
                 position=chunk_id % 10,
                 leave=False
             ) as pbar:
-                # Process the data (in this case, just pass it through)
-                # This is where you would do any processing if needed
+                # Load the index file directly in this process
+                pbar.update(10)
+                index_data = torch.load(index_path, map_location='cpu')
+                pbar.update(40)
                 
-                # Update progress bar
-                pbar.update(len(offsets))
+                # Extract only the needed slices
+                offsets = index_data['offsets'][start_idx:end_idx].tolist()  # Convert to list for easier serialization
+                pbar.update(10)
+                
+                sample_lengths = index_data['sample_lengths'][start_idx:end_idx].tolist()
+                pbar.update(10)
+                
+                # For cumulative lengths, we need to adjust based on the chunk
+                if start_idx == 0:
+                    # First chunk, take as is
+                    cumulative_lengths = index_data['cumulative_lengths'][start_idx:end_idx].tolist()
+                elif start_idx < len(index_data['cumulative_lengths']):
+                    # Subsequent chunks, adjust to start from 0
+                    prev_cumulative = index_data['cumulative_lengths'][start_idx - 1]
+                    cumulative_lengths = [
+                        cl - prev_cumulative for cl in index_data['cumulative_lengths'][start_idx:end_idx].tolist()
+                    ]
+                else:
+                    cumulative_lengths = []
+                pbar.update(20)
+                
+                # Clear data to free memory
+                del index_data
+                pbar.update(10)
+                
+                # Force garbage collection
+                import gc
+                gc.collect()
             
             # Put results in queue
             result_queue.put((chunk_id, offsets, sample_lengths, cumulative_lengths))
