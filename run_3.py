@@ -125,10 +125,9 @@ class CharGenLazyDataset(Dataset):
         self.max_gen_len = max_gen_len
         
         # Use number of CPU cores if not specified
-        if num_workers is None:
-            num_workers = max(1, mp.cpu_count() - 1)
+        self.num_workers = num_workers if num_workers is not None else max(1, mp.cpu_count() - 1)
         
-        print(f"🔄 Using {num_workers} workers for index building")
+        print(f"🔄 Using {self.num_workers} workers for index building")
         
         # Check if cached index exists
         index_path = f"{json_path}.index"
@@ -154,12 +153,12 @@ class CharGenLazyDataset(Dataset):
         print(f"Found {total_lines:,} lines in dataset")
         
         # Parallel processing of file chunks
-        print(f"Building sample index using {num_workers} workers...")
+        print(f"Building sample index using {self.num_workers} workers...")
         
         # Split the file into chunks for parallel processing
-        chunk_size = math.ceil(total_lines / num_workers)
+        chunk_size = math.ceil(total_lines / self.num_workers)
         chunks = [(json_path, i * chunk_size, min((i + 1) * chunk_size, total_lines)) 
-                 for i in range(num_workers)]
+                 for i in range(self.num_workers)]
         
         # Process chunks in parallel
         all_offsets = []
@@ -167,7 +166,7 @@ class CharGenLazyDataset(Dataset):
         total_expanded_samples = 0
         
         # Explicitly create a ProcessPoolExecutor with the specified number of workers
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
             # Submit all tasks to the executor
             future_to_chunk = {executor.submit(process_chunk, chunk): i for i, chunk in enumerate(chunks)}
             
@@ -175,7 +174,7 @@ class CharGenLazyDataset(Dataset):
             for future in tqdm(
                 concurrent.futures.as_completed(future_to_chunk), 
                 total=len(chunks),
-                desc=f"Processing chunks with {num_workers} workers",
+                desc=f"Processing chunks with {self.num_workers} workers",
                 unit="chunk"
             ):
                 chunk_idx = future_to_chunk[future]
@@ -534,7 +533,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="char_autocorrect.pt")
     parser.add_argument("--chunk_size", type=int, default=1000000, help="Number of samples to process in each chunk")
     parser.add_argument("--num_workers", type=int, default=8, help="Number of worker processes for data loading")
-    parser.add_argument("--index_workers", type=int, default=None, help="Number of worker processes for index building (default: CPU count - 1)")
+    parser.add_argument("--index_workers", type=int, default=8, help="Number of worker processes for index building")
     args = parser.parse_args()
 
     from gensim.models import KeyedVectors
@@ -581,6 +580,10 @@ if __name__ == "__main__":
         else:
             print("No existing model found. Training new model from scratch.")
 
+        # Print the number of workers being used
+        print(f"🔧 Using {args.index_workers} workers for index building")
+        print(f"🔧 Using {args.num_workers} workers for data loading")
+        
         # Now proceed to dataset and training as before
         dataset = CharGenLazyDataset(args.data, w2v_model, char_to_id,
                                 ctx_len=args.ctx_len, max_word_len=args.max_word_len, 
