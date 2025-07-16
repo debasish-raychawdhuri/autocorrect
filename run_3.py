@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import json
 import argparse
+import random
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import string
@@ -73,18 +74,29 @@ class CharGenLazyDataset(Dataset):
             f.seek(self.offsets[idx])
             line = f.readline()
             sample = json.loads(line.strip())
-        context = pad_context(sample["context"], self.ctx_len)
-        misspelled = sample["misspelled"]
-        prefix = sample["generated_prefix"]
-        next_char = sample["next_char"]
+        
+        # Parse input text to get context and misspelled word
+        input_text = sample["input"].split()
+        misspelled = input_text[-1]  # Last word is misspelled
+        context = input_text[:-1]    # Rest is context
+        target = sample["target"]    # Correct word
+        
+        # Generate a random prefix length for this training example
+        prefix_len = random.randint(0, len(target))
+        prefix = target[:prefix_len]
+        next_char = target[prefix_len] if prefix_len < len(target) else "<eow>"
+        
+        # Process as before
+        context = pad_context(context, self.ctx_len)
         context_vec = vectorize_context(context, self.w2v_model, self.ctx_len)
         misspelled_oh = one_hot_chars(misspelled, self.char_to_id, self.max_word_len)
         prefix_oh = one_hot_chars(prefix, self.char_to_id, self.max_gen_len)
-        # "<eow>" is used as end-of-word
+        
         if next_char == "<eow>":
             next_id = self.char_to_id["<eow>"]
         else:
             next_id = self.char_to_id.get(next_char, 0)
+        
         return (
             torch.tensor(context_vec, dtype=torch.float32),
             torch.tensor(misspelled_oh, dtype=torch.float32),
