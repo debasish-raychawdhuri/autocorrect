@@ -603,92 +603,33 @@ class CharGenLazyDataset(Dataset):
                 leave=False  # Don't leave the progress bar when done
             )
             
-            try:
-                # First try the optimized approach
-                import pickle
-                with open(index_path, 'rb') as f:
-                    try:
-                        # Update progress
-                        worker_progress.update(10)
-                        
-                        # Skip the PyTorch header
-                        magic_number = pickle.load(f)
-                        protocol_version = pickle.load(f)
-                        sys_info = pickle.load(f)
-                        
-                        # Update progress
-                        worker_progress.update(20)
-                        
-                        # Load the actual data dictionary
-                        data = pickle.load(f)
-                        
-                        # Update progress
-                        worker_progress.update(30)
-                        
-                        # Extract only the needed portions
-                        if 'offsets' in data:
-                            offsets = data['offsets'][start_idx:end_idx]
-                            worker_progress.update(10)
-                        
-                        if 'sample_lengths' in data:
-                            sample_lengths = data['sample_lengths'][start_idx:end_idx]
-                            worker_progress.update(10)
-                        
-                        # For cumulative lengths, we need to adjust based on the chunk
-                        if 'cumulative_lengths' in data:
-                            if start_idx == 0:
-                                # First chunk, take as is
-                                cumulative_lengths = data['cumulative_lengths'][start_idx:end_idx]
-                            elif start_idx < len(data['cumulative_lengths']):
-                                # Subsequent chunks, adjust to start from 0
-                                prev_cumulative = data['cumulative_lengths'][start_idx - 1]
-                                cumulative_lengths = [
-                                    cl - prev_cumulative for cl in data['cumulative_lengths'][start_idx:end_idx]
-                                ]
-                            worker_progress.update(10)
-                        
-                        # Clear data to free memory
-                        del data
-                        worker_progress.update(10)
-                    except Exception as e:
-                        print(f"Error with optimized loading: {e}, falling back to torch.load")
-                        raise
-            except Exception:
-                # Fall back to standard torch.load if the optimized approach fails
-                print(f"Process {pid} falling back to standard torch.load")
-                try:
-                    # Reset progress
-                    worker_progress.reset()
-                    
-                    # Use torch.load with map_location='cpu' to ensure it loads on CPU
-                    index_data = torch.load(index_path, map_location='cpu')
-                    worker_progress.update(50)
-                    
-                    # Extract the relevant chunks
-                    offsets = index_data['offsets'][start_idx:end_idx]
-                    worker_progress.update(10)
-                    
-                    sample_lengths = index_data['sample_lengths'][start_idx:end_idx]
-                    worker_progress.update(10)
-                    
-                    # For cumulative lengths, we need to adjust based on the chunk
-                    if start_idx == 0:
-                        # First chunk, take as is
-                        cumulative_lengths = index_data['cumulative_lengths'][start_idx:end_idx]
-                    elif start_idx < len(index_data['cumulative_lengths']):
-                        # Subsequent chunks, adjust to start from 0
-                        prev_cumulative = index_data['cumulative_lengths'][start_idx - 1]
-                        cumulative_lengths = [
-                            cl - prev_cumulative for cl in index_data['cumulative_lengths'][start_idx:end_idx]
-                        ]
-                    worker_progress.update(20)
-                    
-                    # Clear data to free memory
-                    del index_data
-                    worker_progress.update(10)
-                except Exception as e:
-                    print(f"Both loading methods failed: {e}")
-                    raise
+            # Use torch.load with map_location='cpu' to ensure it loads on CPU
+            worker_progress.update(10)
+            index_data = torch.load(index_path, map_location='cpu')
+            worker_progress.update(40)
+            
+            # Extract the relevant chunks
+            offsets = index_data['offsets'][start_idx:end_idx]
+            worker_progress.update(10)
+            
+            sample_lengths = index_data['sample_lengths'][start_idx:end_idx]
+            worker_progress.update(10)
+            
+            # For cumulative lengths, we need to adjust based on the chunk
+            if start_idx == 0:
+                # First chunk, take as is
+                cumulative_lengths = index_data['cumulative_lengths'][start_idx:end_idx]
+            elif start_idx < len(index_data['cumulative_lengths']):
+                # Subsequent chunks, adjust to start from 0
+                prev_cumulative = index_data['cumulative_lengths'][start_idx - 1]
+                cumulative_lengths = [
+                    cl - prev_cumulative for cl in index_data['cumulative_lengths'][start_idx:end_idx]
+                ]
+            worker_progress.update(20)
+            
+            # Clear data to free memory
+            del index_data
+            worker_progress.update(10)
             
             # Force garbage collection before sending results
             import gc
