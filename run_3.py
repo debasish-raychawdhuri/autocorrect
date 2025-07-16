@@ -13,6 +13,7 @@ import time
 from batch_sampler import BatchSamplerByChunks
 from functools import lru_cache
 import multiprocessing as mp
+import concurrent.futures
 from concurrent.futures import ProcessPoolExecutor
 import math
 
@@ -75,6 +76,12 @@ def create_charmap():
 
 # ---- Input Preparation ----
 
+def pad_context(context_words, ctx_len=10):
+    """Pad or truncate context words to the specified length"""
+    if len(context_words) > ctx_len:
+        return context_words[-ctx_len:]  # Take last ctx_len words
+    return context_words  # Will be padded with zeros in vectorize_context
+
 def one_hot_chars(seq, char_to_id, max_len):
     """Optimized one-hot encoding using numpy operations"""
     char_vocab_size = len(char_to_id)
@@ -121,6 +128,8 @@ class CharGenLazyDataset(Dataset):
         if num_workers is None:
             num_workers = max(1, mp.cpu_count() - 1)
         
+        print(f"🔄 Using {num_workers} workers for index building")
+        
         # Check if cached index exists
         index_path = f"{json_path}.index"
         
@@ -157,29 +166,42 @@ class CharGenLazyDataset(Dataset):
         all_sample_lengths = []
         total_expanded_samples = 0
         
+        # Explicitly create a ProcessPoolExecutor with the specified number of workers
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            results = list(tqdm(
-                executor.map(process_chunk, chunks),
-                total=len(chunks),
-                desc="Processing chunks",
-                unit="chunk"
-            ))
+            # Submit all tasks to the executor
+            future_to_chunk = {executor.submit(process_chunk, chunk): i for i, chunk in enumerate(chunks)}
             
-            # Combine results
-            for offsets, sample_lengths, expanded_samples in results:
-                # Adjust offsets for chunks after the first one
-                if all_offsets:
-                    # Find the correct starting position
-                    with open(json_path, 'rb') as f:
-                        if offsets:
-                            f.seek(offsets[0])
+            # Process results as they complete
+            for future in tqdm(
+                concurrent.futures.as_completed(future_to_chunk), 
+                total=len(chunks),
+                desc=f"Processing chunks with {num_workers} workers",
+                unit="chunk"
+            ):
+                chunk_idx = future_to_chunk[future]
+                try:
+                    offsets, sample_lengths, expanded_samples = future.result()
+                    
+                    # Adjust offsets for chunks after the first one
+                    if chunk_idx > 0 and offsets:
+                        # Calculate the correct file position
+                        chunk_start_line = chunks[chunk_idx][1]  # Start line for this chunk
+                        with open(json_path, 'rb') as f:
+                            # Skip to the start line of this chunk
+                            for _ in range(chunk_start_line):
+                                f.readline()
                             # This is the actual position in the file
-                            actual_pos = offsets[0]
-                            offsets = [pos + actual_pos for pos in offsets]
-                
-                all_offsets.extend(offsets)
-                all_sample_lengths.extend(sample_lengths)
-                total_expanded_samples += expanded_samples
+                            actual_pos = f.tell()
+                            # Adjust all offsets in this chunk
+                            offsets = [pos - offsets[0] + actual_pos for pos in offsets]
+                    
+                    all_offsets.extend(offsets)
+                    all_sample_lengths.extend(sample_lengths)
+                    total_expanded_samples += expanded_samples
+                    
+                except Exception as e:
+                    print(f"Error processing chunk {chunk_idx}: {e}")
+                    raise
         
         self.offsets = all_offsets
         self.sample_lengths = all_sample_lengths
