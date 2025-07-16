@@ -13,6 +13,7 @@ import time
 import sys
 import signal
 import atexit
+import psutil
 from batch_sampler import BatchSamplerByChunks
 from functools import lru_cache
 import multiprocessing as mp
@@ -412,16 +413,32 @@ class CharGenLazyDataset(Dataset):
         
         # First load just the metadata to get sizes
         print("Loading index metadata...")
-        with open(index_path, 'rb') as f:
-            metadata = torch.load(f, map_location='cpu')
-            total_samples = metadata['total_samples']
-            offsets_size = len(metadata['offsets'])
-            print(f"Index contains {offsets_size:,} samples, {total_samples:,} expanded samples")
-            # Free memory
-            del metadata
+        try:
+            # Print current memory usage
+            import psutil
+            process = psutil.Process(os.getpid())
+            print(f"Memory usage before loading metadata: {process.memory_info().rss / (1024 * 1024):.2f} MB")
+            
+            with open(index_path, 'rb') as f:
+                metadata = torch.load(f, map_location='cpu')
+                total_samples = metadata['total_samples']
+                offsets_size = len(metadata['offsets'])
+                print(f"Index contains {offsets_size:,} samples, {total_samples:,} expanded samples")
+                # Free memory
+                del metadata
+            
+            # Print memory usage after loading metadata
+            print(f"Memory usage after loading metadata: {process.memory_info().rss / (1024 * 1024):.2f} MB")
+            
+        except Exception as e:
+            print(f"Error loading metadata: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
         
-        # Calculate chunk sizes for processing
-        num_chunks = self.num_workers
+        # Calculate chunk sizes for processing - use sequential processing with fewer workers
+        # to reduce memory pressure
+        num_chunks = max(1, self.num_workers // 2)  # Use half the workers to reduce memory pressure
         chunk_size = max(1, offsets_size // num_chunks)
         
         print(f"Starting with {num_chunks} chunks, chunk size: {chunk_size:,}")
@@ -436,67 +453,75 @@ class CharGenLazyDataset(Dataset):
             unit="samples"
         )
         
-        # Process chunks in parallel
-        processes = []
+        # Process chunks sequentially to reduce memory pressure
+        all_results = []
         
         try:
-            # Create and start processes for all chunks
-            for i in range(num_chunks):
+            for chunk_idx in range(num_chunks):
                 # Calculate chunk range
-                start_idx = i * chunk_size
-                end_idx = min((i + 1) * chunk_size, offsets_size)
+                start_idx = chunk_idx * chunk_size
+                end_idx = min((chunk_idx + 1) * chunk_size, offsets_size)
                 
                 if start_idx >= end_idx:
                     continue
                 
-                # Create and start process - pass only indices, not actual data
-                p = mp.Process(
-                    target=self._process_index_chunk,
-                    args=(i, index_path, start_idx, end_idx, result_queue),
-                    daemon=True
-                )
+                print(f"Processing chunk {chunk_idx+1}/{num_chunks}: {start_idx:,} to {end_idx:,}")
                 
-                # Add to global process list for cleanup
-                _all_processes.append(p)
+                # Print memory usage before processing chunk
+                print(f"Memory usage before processing chunk {chunk_idx+1}: {process.memory_info().rss / (1024 * 1024):.2f} MB")
                 
-                processes.append(p)
-                p.start()
-                print(f"Started process {p.pid} for chunk {i} ({start_idx:,} to {end_idx:,})")
-            
-            # Collect results from all processes
-            results = []
-            for _ in range(len(processes)):
+                # Process this chunk directly in the main process
                 try:
-                    chunk_id, offsets, sample_lengths, cumulative_lengths = result_queue.get(timeout=60)
-                    results.append((chunk_id, offsets, sample_lengths, cumulative_lengths))
-                    overall_progress.update(len(offsets))
+                    print(f"Loading chunk {chunk_idx+1} data...")
+                    index_data = torch.load(index_path, map_location='cpu')
+                    
+                    # Extract only the needed slices for this chunk
+                    chunk_offsets = index_data['offsets'][start_idx:end_idx].tolist()
+                    chunk_sample_lengths = index_data['sample_lengths'][start_idx:end_idx].tolist()
+                    
+                    # For cumulative lengths, we need to adjust based on the chunk
+                    if start_idx == 0:
+                        # First chunk, take as is
+                        chunk_cumulative_lengths = index_data['cumulative_lengths'][start_idx:end_idx].tolist()
+                    elif start_idx < len(index_data['cumulative_lengths']):
+                        # Subsequent chunks, adjust to start from 0
+                        prev_cumulative = index_data['cumulative_lengths'][start_idx - 1]
+                        chunk_cumulative_lengths = [
+                            cl - prev_cumulative for cl in index_data['cumulative_lengths'][start_idx:end_idx].tolist()
+                        ]
+                    else:
+                        chunk_cumulative_lengths = []
+                    
+                    # Clear data to free memory
+                    del index_data
+                    
+                    # Force garbage collection
+                    import gc
+                    gc.collect()
+                    
+                    # Store results
+                    all_results.append((chunk_idx, chunk_offsets, chunk_sample_lengths, chunk_cumulative_lengths))
+                    
+                    # Update progress
+                    overall_progress.update(len(chunk_offsets))
+                    
+                    # Print memory usage after processing chunk
+                    print(f"Memory usage after processing chunk {chunk_idx+1}: {process.memory_info().rss / (1024 * 1024):.2f} MB")
+                    
                 except Exception as e:
-                    print(f"Error collecting results: {e}")
+                    print(f"Error processing chunk {chunk_idx+1}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
             
-            # Wait for all processes to finish
-            for p in processes:
-                p.join(timeout=5)
-                if p.is_alive():
-                    print(f"Warning: Process {p.pid} did not terminate, forcing termination")
-                    p.terminate()
-                    p.join(timeout=1)
-                    if p.is_alive():
-                        print(f"Error: Could not terminate process {p.pid}")
-                        try:
-                            os.kill(p.pid, signal.SIGKILL)
-                        except:
-                            pass
+            # Close progress bar
+            overall_progress.close()
             
-            # Remove processes from global list
-            for p in processes:
-                if p in _all_processes:
-                    _all_processes.remove(p)
+            # Sort results by chunk_id (should already be in order, but just to be safe)
+            all_results.sort(key=lambda x: x[0])
             
-            # Sort results by chunk_id
-            results.sort(key=lambda x: x[0])
-            
-            # Process results
-            for chunk_id, offsets, sample_lengths, cumulative_lengths in results:
+            # Process all results
+            for chunk_id, offsets, sample_lengths, cumulative_lengths in all_results:
                 self.offsets.extend(offsets)
                 self.sample_lengths.extend(sample_lengths)
                 
@@ -507,12 +532,12 @@ class CharGenLazyDataset(Dataset):
                 else:
                     self.cumulative_lengths.extend(cumulative_lengths)
             
-            # Close progress bar
-            overall_progress.close()
-            
             # Set total samples
             self.total_samples = total_samples
             print(f"All chunks processed successfully")
+            
+            # Print final memory usage
+            print(f"Final memory usage: {process.memory_info().rss / (1024 * 1024):.2f} MB")
             
         except Exception as e:
             # Close progress bar in case of error
@@ -521,16 +546,6 @@ class CharGenLazyDataset(Dataset):
             print(f"Error during index loading: {str(e)}")
             import traceback
             traceback.print_exc()
-            
-            # Clean up any remaining processes
-            for p in processes:
-                if p.is_alive():
-                    print(f"Terminating process {p.pid}")
-                    p.terminate()
-                    # Remove from global list
-                    if p in _all_processes:
-                        _all_processes.remove(p)
-            
             raise
     
     @staticmethod
