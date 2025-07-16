@@ -432,13 +432,21 @@ class CharGenLazyDataset(Dataset):
         
         print(f"Starting with {num_chunks} chunks, chunk size: {chunk_size:,}")
         
+        # Create overall progress bar for all chunks
+        overall_progress = tqdm(
+            total=offsets_size,
+            desc="Overall index loading progress",
+            unit="samples"
+        )
+        
         try:
             # Process chunks in batches to limit memory usage
-            for batch_start in range(0, num_chunks, self.num_workers):
+            batch_ranges = list(range(0, num_chunks, self.num_workers))
+            for batch_idx, batch_start in enumerate(batch_ranges):
                 batch_end = min(batch_start + self.num_workers, num_chunks)
                 active_workers = batch_end - batch_start
                 
-                print(f"Processing batch of {active_workers} chunks ({batch_start} to {batch_end-1})")
+                print(f"Processing batch {batch_idx+1}/{len(batch_ranges)}: {active_workers} chunks ({batch_start} to {batch_end-1})")
                 
                 # Clear previous batch data
                 processes = []
@@ -471,23 +479,35 @@ class CharGenLazyDataset(Dataset):
                     p.start()
                     print(f"Started process {p.pid} for chunk {i} ({start_idx:,} to {end_idx:,})")
                 
+                # Create progress bar for this batch
+                batch_progress = tqdm(
+                    total=len(processes),
+                    desc=f"Batch {batch_idx+1}/{len(batch_ranges)}",
+                    unit="chunks"
+                )
+                
                 # Collect results from all processes in this batch with timeout
                 batch_results = []
                 for i, pipe in enumerate(pipes):
                     if i >= len(processes):
                         continue
                     
-                    print(f"Waiting for results from process {batch_start + i}...")
                     try:
                         # Set a timeout for receiving data
                         if pipe.poll(30):  # Wait up to 30 seconds
                             result = pipe.recv()
                             batch_results.append(result)
-                            print(f"Received results from process {batch_start + i}")
+                            # Update progress bars
+                            batch_progress.update(1)
+                            chunk_id, offsets, sample_lengths, _ = result
+                            overall_progress.update(len(offsets))
                         else:
                             print(f"Timeout waiting for process {batch_start + i}")
                     except EOFError:
                         print(f"Error: Process {batch_start + i} closed pipe unexpectedly")
+                
+                # Close batch progress bar
+                batch_progress.close()
                 
                 # Wait for all processes in this batch to finish
                 for p in processes:
@@ -527,13 +547,19 @@ class CharGenLazyDataset(Dataset):
                 import gc
                 gc.collect()
                 
-                print(f"Completed batch {batch_start}-{batch_end-1}, processed {len(self.offsets):,} samples so far")
+                print(f"Completed batch {batch_idx+1}/{len(batch_ranges)}, processed {len(self.offsets):,} samples so far")
+            
+            # Close overall progress bar
+            overall_progress.close()
             
             # Set total samples
             self.total_samples = total_samples
             print(f"All chunks processed successfully")
             
         except Exception as e:
+            # Close progress bars in case of error
+            overall_progress.close()
+            
             print(f"Error during index loading: {str(e)}")
             import traceback
             traceback.print_exc()
@@ -627,25 +653,44 @@ class CharGenLazyDataset(Dataset):
             sample_lengths = []
             cumulative_lengths = []
             
+            # Create a progress bar for this worker
+            worker_progress = tqdm(
+                total=100,  # We'll update based on percentage
+                desc=f"Worker {pid} (chunk {chunk_id})",
+                position=chunk_id % 10,  # Stagger progress bars
+                leave=False  # Don't leave the progress bar when done
+            )
+            
             try:
                 # First try the optimized approach
                 import pickle
                 with open(index_path, 'rb') as f:
                     try:
+                        # Update progress
+                        worker_progress.update(10)
+                        
                         # Skip the PyTorch header
                         magic_number = pickle.load(f)
                         protocol_version = pickle.load(f)
                         sys_info = pickle.load(f)
                         
+                        # Update progress
+                        worker_progress.update(20)
+                        
                         # Load the actual data dictionary
                         data = pickle.load(f)
+                        
+                        # Update progress
+                        worker_progress.update(30)
                         
                         # Extract only the needed portions
                         if 'offsets' in data:
                             offsets = data['offsets'][start_idx:end_idx]
+                            worker_progress.update(10)
                         
                         if 'sample_lengths' in data:
                             sample_lengths = data['sample_lengths'][start_idx:end_idx]
+                            worker_progress.update(10)
                         
                         # For cumulative lengths, we need to adjust based on the chunk
                         if 'cumulative_lengths' in data:
@@ -658,9 +703,11 @@ class CharGenLazyDataset(Dataset):
                                 cumulative_lengths = [
                                     cl - prev_cumulative for cl in data['cumulative_lengths'][start_idx:end_idx]
                                 ]
+                            worker_progress.update(10)
                         
                         # Clear data to free memory
                         del data
+                        worker_progress.update(10)
                     except Exception as e:
                         print(f"Error with optimized loading: {e}, falling back to torch.load")
                         raise
@@ -668,12 +715,19 @@ class CharGenLazyDataset(Dataset):
                 # Fall back to standard torch.load if the optimized approach fails
                 print(f"Process {pid} falling back to standard torch.load")
                 try:
+                    # Reset progress
+                    worker_progress.reset()
+                    
                     # Use torch.load with map_location='cpu' to ensure it loads on CPU
                     index_data = torch.load(index_path, map_location='cpu')
+                    worker_progress.update(50)
                     
                     # Extract the relevant chunks
                     offsets = index_data['offsets'][start_idx:end_idx]
+                    worker_progress.update(10)
+                    
                     sample_lengths = index_data['sample_lengths'][start_idx:end_idx]
+                    worker_progress.update(10)
                     
                     # For cumulative lengths, we need to adjust based on the chunk
                     if start_idx == 0:
@@ -685,9 +739,11 @@ class CharGenLazyDataset(Dataset):
                         cumulative_lengths = [
                             cl - prev_cumulative for cl in index_data['cumulative_lengths'][start_idx:end_idx]
                         ]
+                    worker_progress.update(20)
                     
                     # Clear data to free memory
                     del index_data
+                    worker_progress.update(10)
                 except Exception as e:
                     print(f"Both loading methods failed: {e}")
                     raise
@@ -695,6 +751,9 @@ class CharGenLazyDataset(Dataset):
             # Force garbage collection before sending results
             import gc
             gc.collect()
+            
+            # Complete the progress bar
+            worker_progress.close()
             
             # Send results back through the pipe
             conn.send((chunk_id, offsets, sample_lengths, cumulative_lengths))
