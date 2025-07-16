@@ -109,7 +109,7 @@ def parallel_index_builder(json_path, num_workers):
     
     # Collect results
     results = []
-    for _ in range(len(chunks)):
+    for _ in tqdm(range(len(chunks)), desc=f"Collecting results from {num_workers} workers"):
         results.append(result_queue.get())
     
     # Wait for all processes to finish
@@ -147,7 +147,7 @@ def parallel_index_builder(json_path, num_workers):
     # Build cumulative index
     cumulative_lengths = []
     cumsum = 0
-    for length in all_sample_lengths:
+    for length in tqdm(all_sample_lengths, desc="Building cumulative index"):
         cumsum += length
         cumulative_lengths.append(cumsum)
     
@@ -244,7 +244,7 @@ class CharGenLazyDataset(Dataset):
         # Use completely separate process for index building
         print(f"Starting index building with {self.num_workers} workers...")
         
-        # Build index in a separate process to avoid GIL issues
+        # Build index using our parallel implementation
         all_offsets, all_sample_lengths, cumulative_lengths, total_expanded_samples = parallel_index_builder(
             json_path, self.num_workers
         )
