@@ -42,32 +42,80 @@ def process_chunk(chunk_info):
     total_expanded_samples = 0
     
     try:
-        with open(filename, 'rb') as f:
-            # Skip to start_line
-            for _ in range(start_line):
-                f.readline()
+        # Open file with a large buffer to reduce I/O operations
+        with open(filename, 'rb', buffering=8*1024*1024) as f:
+            # Skip to start_line - use efficient skipping
+            if start_line > 0:
+                # First try to seek to an approximate position
+                # Estimate bytes per line from first few lines
+                sample_size = 1000
+                f.seek(0)
+                sample_data = f.read(sample_size)
+                newline_count = sample_data.count(b'\n')
+                if newline_count > 0:
+                    bytes_per_line_estimate = sample_size / newline_count
+                    # Seek to estimated position
+                    f.seek(int(start_line * bytes_per_line_estimate))
+                    # Count lines to adjust position
+                    line_count = 0
+                    while True:
+                        if f.readline():
+                            line_count += 1
+                        else:
+                            break
+                    # Seek back to beginning and skip lines properly
+                    f.seek(0)
+                    lines_to_skip = max(0, start_line - line_count)
+                else:
+                    lines_to_skip = start_line
+                
+                # Skip remaining lines
+                for _ in range(lines_to_skip):
+                    f.readline()
             
             # Process assigned chunk
             pos = f.tell()
-            for _ in range(end_line - start_line):
-                line = f.readline()
-                if not line:  # End of file
-                    break
-                    
-                offsets.append(pos)
-                pos += len(line)
+            lines_processed = 0
+            
+            # Read in larger blocks for efficiency
+            while lines_processed < (end_line - start_line):
+                # Read a block of lines
+                block_size = min(1000, (end_line - start_line) - lines_processed)
+                block_lines = []
+                block_positions = []
                 
-                # Count prefix samples this line will generate
-                try:
-                    sample = json.loads(line.strip().decode('utf-8'))
-                    target = sample["target"]
-                    prefix_count = len(target) + 1  # +1 for the <eow> case
-                    sample_lengths.append(prefix_count)
-                    total_expanded_samples += prefix_count
-                except Exception as e:
-                    # Handle corrupted lines
-                    sample_lengths.append(1)
-                    total_expanded_samples += 1
+                for _ in range(block_size):
+                    block_positions.append(pos)
+                    line = f.readline()
+                    if not line:  # End of file
+                        break
+                    block_lines.append(line)
+                    pos += len(line)
+                
+                if not block_lines:
+                    break
+                
+                # Process the block
+                for i, line in enumerate(block_lines):
+                    offsets.append(block_positions[i])
+                    
+                    # Count prefix samples this line will generate
+                    try:
+                        sample = json.loads(line.strip().decode('utf-8'))
+                        target = sample["target"]
+                        prefix_count = len(target) + 1  # +1 for the <eow> case
+                        sample_lengths.append(prefix_count)
+                        total_expanded_samples += prefix_count
+                    except Exception as e:
+                        # Handle corrupted lines
+                        sample_lengths.append(1)
+                        total_expanded_samples += 1
+                
+                lines_processed += len(block_lines)
+                
+                # Periodically report progress
+                if lines_processed % 10000 == 0:
+                    print(f"Worker {worker_id} (chunk {chunk_id}): processed {lines_processed}/{end_line-start_line} lines")
         
         # Print completion information
         print(f"Worker {worker_id} completed chunk {chunk_id}: {len(offsets)} samples, {total_expanded_samples} expanded samples")
@@ -98,16 +146,39 @@ def parallel_index_builder(json_path, num_workers):
     processes = []
     result_queue = mp.Queue()
     
+    # Set CPU affinity if possible (Linux only)
+    try:
+        import psutil
+        p = psutil.Process()
+        # Get available CPUs
+        available_cpus = list(range(psutil.cpu_count()))
+        print(f"Available CPUs: {available_cpus}")
+    except ImportError:
+        print("psutil not available, skipping CPU affinity setting")
+        available_cpus = None
+    
+    # Start processes with specific CPU affinity if possible
     for i, chunk in enumerate(chunks):
         p = mp.Process(
             target=process_chunk_wrapper,
             args=(chunk, result_queue)
         )
+        
+        # Try to set CPU affinity if psutil is available
+        if available_cpus and i < len(available_cpus):
+            try:
+                # Assign each process to a specific CPU
+                p.cpu_affinity([available_cpus[i % len(available_cpus)]])
+                print(f"Set process {i} to CPU {available_cpus[i % len(available_cpus)]}")
+            except AttributeError:
+                # cpu_affinity might not be available on all platforms
+                print("CPU affinity setting not supported")
+        
         processes.append(p)
         p.start()
         print(f"Started process {p.pid} for chunk {i}")
     
-    # Collect results
+    # Collect results with progress bar
     results = []
     for _ in tqdm(range(len(chunks)), desc=f"Collecting results from {num_workers} workers"):
         results.append(result_queue.get())
@@ -155,6 +226,26 @@ def parallel_index_builder(json_path, num_workers):
 
 def process_chunk_wrapper(chunk, result_queue):
     """Wrapper function to put results in queue"""
+    # Try to set higher I/O priority
+    try:
+        import os
+        import resource
+        # Set process to high priority
+        os.nice(-10)
+    except (ImportError, PermissionError):
+        pass
+    
+    # Try to set CPU affinity if psutil is available
+    try:
+        import psutil
+        p = psutil.Process()
+        # Get current CPU affinity
+        current_affinity = p.cpu_affinity()
+        print(f"Process {os.getpid()} running with CPU affinity: {current_affinity}")
+    except (ImportError, AttributeError):
+        pass
+    
+    # Process the chunk
     result = process_chunk(chunk)
     result_queue.put(result)
 
@@ -564,6 +655,19 @@ if __name__ == "__main__":
     except RuntimeError:
         # Method already set
         pass
+    
+    # Try to install psutil if not available
+    try:
+        import psutil
+    except ImportError:
+        print("psutil not found, trying to install...")
+        try:
+            import subprocess
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "psutil"])
+            import psutil
+            print("psutil installed successfully")
+        except Exception as e:
+            print(f"Could not install psutil: {e}")
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", action="store_true")
