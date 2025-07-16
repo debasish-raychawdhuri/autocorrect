@@ -341,10 +341,6 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
         
         # Force garbage collection between epochs
         torch.cuda.empty_cache()
-            epoch_loss += loss.item()
-            loop.set_postfix(loss=loss.item())
-        print(f"Epoch {epoch+1}: Avg Loss = {epoch_loss / len(dataloader):.4f}")
-        torch.save(model.state_dict(), save_path)
 
 def predict_word(model, w2v_model, char_to_id, id_to_char, context_words, misspelled_word,
                  max_word_len=30, max_gen_len=50, ctx_len=10, max_output_len=30, beam_width=10):
