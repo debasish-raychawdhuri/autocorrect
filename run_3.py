@@ -13,6 +13,7 @@ import time
 import sys
 import signal
 import atexit
+import glob
 from batch_sampler import BatchSamplerByChunks
 from functools import lru_cache
 import multiprocessing as mp
@@ -36,6 +37,22 @@ def cleanup_processes():
                     os.kill(p.pid, signal.SIGKILL)
             except Exception as e:
                 print(f"Error terminating process {p.pid}: {e}")
+    
+    # Clean up any temporary files
+    cleanup_temp_files()
+
+def cleanup_temp_files():
+    """Clean up any temporary files created for data transfer"""
+    try:
+        # Remove all temporary files created by our processes
+        for temp_file in glob.glob("/tmp/index_chunk_*.pkl"):
+            try:
+                os.remove(temp_file)
+                print(f"Removed temporary file: {temp_file}")
+            except:
+                pass
+    except Exception as e:
+        print(f"Error cleaning up temporary files: {e}")
 
 # Register cleanup function
 atexit.register(cleanup_processes)
@@ -492,8 +509,21 @@ class CharGenLazyDataset(Dataset):
                     try:
                         # Set a timeout for receiving data
                         if pipe.poll(30):  # Wait up to 30 seconds
-                            result = pipe.recv()
-                            batch_results.append(result)
+                            # Receive the temporary file path
+                            temp_file_path = pipe.recv()
+                            
+                            # Load the data from the temporary file
+                            import pickle
+                            with open(temp_file_path, 'rb') as f:
+                                result = pickle.load(f)
+                                batch_results.append(result)
+                            
+                            # Delete the temporary file
+                            try:
+                                os.remove(temp_file_path)
+                            except:
+                                pass
+                            
                             # Update progress bars
                             batch_progress.update(1)
                             chunk_id, offsets, sample_lengths, _ = result
@@ -502,6 +532,10 @@ class CharGenLazyDataset(Dataset):
                             print(f"Timeout waiting for process {batch_start + i}")
                     except EOFError:
                         print(f"Error: Process {batch_start + i} closed pipe unexpectedly")
+                    except Exception as e:
+                        print(f"Error receiving results from process {batch_start + i}: {e}")
+                        import traceback
+                        traceback.print_exc()
                 
                 # Close batch progress bar
                 batch_progress.close()
@@ -548,6 +582,9 @@ class CharGenLazyDataset(Dataset):
             
             # Close overall progress bar
             overall_progress.close()
+            
+            # Clean up any temporary files that might be left
+            cleanup_temp_files()
             
             # Set total samples
             self.total_samples = total_samples
@@ -638,8 +675,19 @@ class CharGenLazyDataset(Dataset):
             # Complete the progress bar
             worker_progress.close()
             
-            # Send results back through the pipe
-            conn.send((chunk_id, offsets, sample_lengths, cumulative_lengths))
+            # Instead of sending through pipe, save to a temporary file
+            import tempfile
+            import pickle
+            
+            # Create a temporary file with a unique name based on chunk_id
+            temp_file = f"/tmp/index_chunk_{chunk_id}_{pid}.pkl"
+            
+            # Save the data to the temporary file
+            with open(temp_file, 'wb') as f:
+                pickle.dump((chunk_id, offsets, sample_lengths, cumulative_lengths), f)
+            
+            # Send just the file path through the pipe
+            conn.send(temp_file)
             
             print(f"Process {pid} (chunk {chunk_id}) completed: processed {len(offsets):,} samples")
             
@@ -649,7 +697,11 @@ class CharGenLazyDataset(Dataset):
             traceback.print_exc()
             # Send empty results in case of error
             try:
-                conn.send((chunk_id, [], [], []))
+                # Create an empty temporary file
+                temp_file = f"/tmp/index_chunk_{chunk_id}_{os.getpid()}_error.pkl"
+                with open(temp_file, 'wb') as f:
+                    pickle.dump((chunk_id, [], [], []), f)
+                conn.send(temp_file)
             except:
                 pass
         finally:
