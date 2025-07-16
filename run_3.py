@@ -62,10 +62,19 @@ class CharGenLazyDataset(Dataset):
         self.offsets = []
         self.sample_lengths = []  # Track how many prefix samples each original sample generates
         
+        # Count total lines first for progress bar
+        print("Counting lines in dataset...")
+        with open(json_path, 'r', encoding='utf-8') as f:
+            total_lines = sum(1 for _ in f)
+        
         print("Building sample index...")
         with open(json_path, encoding="utf-8") as f:
             pos = 0
             total_expanded_samples = 0
+            
+            # Create progress bar for indexing
+            pbar = tqdm(total=total_lines, desc="Indexing samples", unit="samples")
+            
             for line_idx, line in enumerate(f):
                 self.offsets.append(pos)
                 pos += len(line.encode("utf-8"))
@@ -77,18 +86,22 @@ class CharGenLazyDataset(Dataset):
                 self.sample_lengths.append(prefix_count)
                 total_expanded_samples += prefix_count
                 
-                if line_idx % 10000 == 0:
-                    print(f"Indexed {line_idx} lines, will generate ~{total_expanded_samples} samples")
+                # Update progress bar
+                pbar.update(1)
+                pbar.set_postfix(expanded_samples=f"{total_expanded_samples:,}")
+            
+            pbar.close()
         
         # Build cumulative index to map global sample index to (line_idx, prefix_idx)
+        print("Building cumulative index...")
         self.cumulative_lengths = []
         cumsum = 0
-        for length in self.sample_lengths:
+        for length in tqdm(self.sample_lengths, desc="Building index", unit="samples"):
             cumsum += length
             self.cumulative_lengths.append(cumsum)
         
         self.total_samples = total_expanded_samples
-        print(f"Dataset will generate {self.total_samples} samples from {len(self.offsets)} original samples")
+        print(f"✅ Dataset ready: {self.total_samples:,} samples from {len(self.offsets):,} original samples")
 
     def __len__(self):
         return self.total_samples
