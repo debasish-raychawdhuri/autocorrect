@@ -58,6 +58,24 @@ class CharGenLazyDataset(Dataset):
         self.max_word_len = max_word_len
         self.max_gen_len = max_gen_len
 
+        # Check if cached index exists
+        index_path = f"{json_path}.index"
+        
+        if os.path.exists(index_path):
+            print(f"📂 Loading cached index from {index_path}")
+            try:
+                index_data = torch.load(index_path)
+                self.offsets = index_data['offsets']
+                self.sample_lengths = index_data['sample_lengths']
+                self.cumulative_lengths = index_data['cumulative_lengths']
+                self.total_samples = index_data['total_samples']
+                
+                print(f"✅ Loaded index: {self.total_samples:,} samples from {len(self.offsets):,} original samples")
+                return
+            except Exception as e:
+                print(f"⚠️ Failed to load cached index: {e}")
+                print("Building new index...")
+
         # Build byte offsets for all lines (original samples)
         self.offsets = []
         self.sample_lengths = []  # Track how many prefix samples each original sample generates
@@ -101,6 +119,20 @@ class CharGenLazyDataset(Dataset):
             self.cumulative_lengths.append(cumsum)
         
         self.total_samples = total_expanded_samples
+        
+        # Save the index for future use
+        print(f"💾 Saving index to {index_path}")
+        try:
+            torch.save({
+                'offsets': self.offsets,
+                'sample_lengths': self.sample_lengths,
+                'cumulative_lengths': self.cumulative_lengths,
+                'total_samples': self.total_samples
+            }, index_path)
+            print(f"✅ Index saved successfully")
+        except Exception as e:
+            print(f"⚠️ Failed to save index: {e}")
+        
         print(f"✅ Dataset ready: {self.total_samples:,} samples from {len(self.offsets):,} original samples")
 
     def __len__(self):
