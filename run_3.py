@@ -10,6 +10,7 @@ from tqdm import tqdm
 import string
 import os
 import time
+import sys
 from batch_sampler import BatchSamplerByChunks
 from functools import lru_cache
 import multiprocessing as mp
@@ -28,49 +29,134 @@ def count_file_lines(filename):
         # Count newline characters
         return sum(1 for _ in f)
 
-def process_chunk(args):
+def process_chunk(chunk_info):
     """Process a chunk of the file to build partial index"""
-    filename, start_line, end_line = args
+    filename, start_line, end_line, chunk_id = chunk_info
     
     # Print worker information for debugging
     worker_id = os.getpid()
-    print(f"Worker {worker_id} processing lines {start_line}-{end_line}")
+    print(f"Worker {worker_id} (chunk {chunk_id}) processing lines {start_line}-{end_line}")
     
     offsets = []
     sample_lengths = []
     total_expanded_samples = 0
     
-    with open(filename, 'rb') as f:
-        # Skip to start_line
-        for _ in range(start_line):
-            f.readline()
-        
-        # Process assigned chunk
-        pos = f.tell()
-        for _ in range(end_line - start_line):
-            line = f.readline()
-            if not line:  # End of file
-                break
-                
-            offsets.append(pos)
-            pos += len(line)
+    try:
+        with open(filename, 'rb') as f:
+            # Skip to start_line
+            for _ in range(start_line):
+                f.readline()
             
-            # Count prefix samples this line will generate
-            try:
-                sample = json.loads(line.strip().decode('utf-8'))
-                target = sample["target"]
-                prefix_count = len(target) + 1  # +1 for the <eow> case
-                sample_lengths.append(prefix_count)
-                total_expanded_samples += prefix_count
-            except Exception as e:
-                # Handle corrupted lines
-                sample_lengths.append(1)
-                total_expanded_samples += 1
+            # Process assigned chunk
+            pos = f.tell()
+            for _ in range(end_line - start_line):
+                line = f.readline()
+                if not line:  # End of file
+                    break
+                    
+                offsets.append(pos)
+                pos += len(line)
+                
+                # Count prefix samples this line will generate
+                try:
+                    sample = json.loads(line.strip().decode('utf-8'))
+                    target = sample["target"]
+                    prefix_count = len(target) + 1  # +1 for the <eow> case
+                    sample_lengths.append(prefix_count)
+                    total_expanded_samples += prefix_count
+                except Exception as e:
+                    # Handle corrupted lines
+                    sample_lengths.append(1)
+                    total_expanded_samples += 1
+        
+        # Print completion information
+        print(f"Worker {worker_id} completed chunk {chunk_id}: {len(offsets)} samples, {total_expanded_samples} expanded samples")
+        
+        return chunk_id, offsets, sample_lengths, total_expanded_samples
     
-    # Print completion information
-    print(f"Worker {worker_id} completed: {len(offsets)} samples, {total_expanded_samples} expanded samples")
+    except Exception as e:
+        print(f"ERROR in worker {worker_id} processing chunk {chunk_id}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return chunk_id, [], [], 0
+
+# Function to run in a separate process
+def parallel_index_builder(json_path, num_workers):
+    """Build index in parallel using direct process creation"""
+    print(f"Starting parallel index builder with {num_workers} workers")
     
-    return offsets, sample_lengths, total_expanded_samples
+    # Count total lines
+    total_lines = count_file_lines(json_path)
+    print(f"Found {total_lines:,} lines in dataset")
+    
+    # Split the file into chunks
+    chunk_size = math.ceil(total_lines / num_workers)
+    chunks = [(json_path, i * chunk_size, min((i + 1) * chunk_size, total_lines), i) 
+             for i in range(num_workers)]
+    
+    # Create processes
+    processes = []
+    result_queue = mp.Queue()
+    
+    for i, chunk in enumerate(chunks):
+        p = mp.Process(
+            target=process_chunk_wrapper,
+            args=(chunk, result_queue)
+        )
+        processes.append(p)
+        p.start()
+        print(f"Started process {p.pid} for chunk {i}")
+    
+    # Collect results
+    results = []
+    for _ in range(len(chunks)):
+        results.append(result_queue.get())
+    
+    # Wait for all processes to finish
+    for p in processes:
+        p.join()
+    
+    print(f"All {len(processes)} processes completed")
+    
+    # Sort results by chunk_id
+    results.sort(key=lambda x: x[0])
+    
+    # Process results
+    all_offsets = []
+    all_sample_lengths = []
+    total_expanded_samples = 0
+    
+    for chunk_id, offsets, sample_lengths, expanded_samples in results:
+        # Adjust offsets for chunks after the first one
+        if chunk_id > 0 and offsets:
+            # Calculate the correct file position
+            chunk_start_line = chunks[chunk_id][1]  # Start line for this chunk
+            with open(json_path, 'rb') as f:
+                # Skip to the start line of this chunk
+                for _ in range(chunk_start_line):
+                    f.readline()
+                # This is the actual position in the file
+                actual_pos = f.tell()
+                # Adjust all offsets in this chunk
+                offsets = [pos - offsets[0] + actual_pos for pos in offsets]
+        
+        all_offsets.extend(offsets)
+        all_sample_lengths.extend(sample_lengths)
+        total_expanded_samples += expanded_samples
+    
+    # Build cumulative index
+    cumulative_lengths = []
+    cumsum = 0
+    for length in all_sample_lengths:
+        cumsum += length
+        cumulative_lengths.append(cumsum)
+    
+    return all_offsets, all_sample_lengths, cumulative_lengths, total_expanded_samples
+
+def process_chunk_wrapper(chunk, result_queue):
+    """Wrapper function to put results in queue"""
+    result = process_chunk(chunk)
+    result_queue.put(result)
 
 # ---- Char Map ----
 
@@ -135,6 +221,7 @@ class CharGenLazyDataset(Dataset):
         self.num_workers = num_workers if num_workers is not None else max(1, mp.cpu_count() - 1)
         
         print(f"🔄 Using {self.num_workers} workers for index building")
+        print(f"🔄 System has {mp.cpu_count()} CPU cores available")
         
         # Check if cached index exists
         index_path = f"{json_path}.index"
@@ -154,78 +241,17 @@ class CharGenLazyDataset(Dataset):
                 print(f"⚠️ Failed to load cached index: {e}")
                 print("Building new index...")
 
-        # Count total lines first for progress bar
-        print("Counting lines in dataset...")
-        total_lines = count_file_lines(json_path)
-        print(f"Found {total_lines:,} lines in dataset")
+        # Use completely separate process for index building
+        print(f"Starting index building with {self.num_workers} workers...")
         
-        # Parallel processing of file chunks
-        print(f"Building sample index using {self.num_workers} workers...")
-        
-        # Split the file into chunks for parallel processing
-        chunk_size = math.ceil(total_lines / self.num_workers)
-        chunks = [(json_path, i * chunk_size, min((i + 1) * chunk_size, total_lines)) 
-                 for i in range(self.num_workers)]
-        
-        # Process chunks in parallel
-        all_offsets = []
-        all_sample_lengths = []
-        total_expanded_samples = 0
-        
-        # Force multiprocessing to use spawn method for better compatibility
-        ctx = mp.get_context('spawn')
-        
-        print(f"🔄 Starting parallel processing with {self.num_workers} workers")
-        print(f"🔄 System has {mp.cpu_count()} CPU cores available")
-        print(f"🔄 Processing {len(chunks)} chunks in parallel")
-        
-        # Use a more direct approach with multiprocessing Pool
-        with ctx.Pool(processes=self.num_workers) as pool:
-            # Use imap_unordered for better load balancing
-            results_iter = pool.imap_unordered(process_chunk, chunks)
-            
-            # Process results as they arrive
-            results = []
-            for result in tqdm(
-                results_iter,
-                total=len(chunks),
-                desc=f"Processing chunks with {self.num_workers} workers",
-                unit="chunk"
-            ):
-                results.append(result)
-        
-        print(f"✅ Parallel processing complete, got {len(results)} results")
-        
-        # Process all results after parallel execution
-        for i, (offsets, sample_lengths, expanded_samples) in enumerate(results):
-            # Adjust offsets for chunks after the first one
-            if i > 0 and offsets:
-                # Calculate the correct file position
-                chunk_start_line = chunks[i][1]  # Start line for this chunk
-                with open(json_path, 'rb') as f:
-                    # Skip to the start line of this chunk
-                    for _ in range(chunk_start_line):
-                        f.readline()
-                    # This is the actual position in the file
-                    actual_pos = f.tell()
-                    # Adjust all offsets in this chunk
-                    offsets = [pos - offsets[0] + actual_pos for pos in offsets]
-            
-            all_offsets.extend(offsets)
-            all_sample_lengths.extend(sample_lengths)
-            total_expanded_samples += expanded_samples
+        # Build index in a separate process to avoid GIL issues
+        all_offsets, all_sample_lengths, cumulative_lengths, total_expanded_samples = parallel_index_builder(
+            json_path, self.num_workers
+        )
         
         self.offsets = all_offsets
         self.sample_lengths = all_sample_lengths
-        
-        # Build cumulative index to map global sample index to (line_idx, prefix_idx)
-        print("Building cumulative index...")
-        self.cumulative_lengths = []
-        cumsum = 0
-        for length in tqdm(self.sample_lengths, desc="Building index", unit="samples"):
-            cumsum += length
-            self.cumulative_lengths.append(cumsum)
-        
+        self.cumulative_lengths = cumulative_lengths
         self.total_samples = total_expanded_samples
         
         # Save the index for future use
@@ -301,7 +327,6 @@ class CharGenLazyDataset(Dataset):
             torch.tensor(prefix_oh, dtype=torch.float32),
             torch.tensor(next_id, dtype=torch.long)
         )
-
 # ---- Custom Activation Function ----
 
 class BiReLU(nn.Module):
@@ -533,8 +558,12 @@ def model_matches(model, state_dict):
 # ---- CLI ----
 
 if __name__ == "__main__":
-    # Set multiprocessing start method to 'spawn' for better compatibility
-    mp.set_start_method('spawn', force=True)
+    # Force multiprocessing to use spawn method for better compatibility
+    try:
+        mp.set_start_method('spawn')
+    except RuntimeError:
+        # Method already set
+        pass
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", action="store_true")
@@ -646,4 +675,3 @@ if __name__ == "__main__":
                     print(f"{i:2d}. {word} (log_prob: {log_prob:.3f})")
         except KeyboardInterrupt:
             print("\nExiting...")
-
