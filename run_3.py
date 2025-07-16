@@ -32,6 +32,10 @@ def process_chunk(args):
     """Process a chunk of the file to build partial index"""
     filename, start_line, end_line = args
     
+    # Print worker information for debugging
+    worker_id = os.getpid()
+    print(f"Worker {worker_id} processing lines {start_line}-{end_line}")
+    
     offsets = []
     sample_lengths = []
     total_expanded_samples = 0
@@ -62,6 +66,9 @@ def process_chunk(args):
                 # Handle corrupted lines
                 sample_lengths.append(1)
                 total_expanded_samples += 1
+    
+    # Print completion information
+    print(f"Worker {worker_id} completed: {len(offsets)} samples, {total_expanded_samples} expanded samples")
     
     return offsets, sample_lengths, total_expanded_samples
 
@@ -165,42 +172,48 @@ class CharGenLazyDataset(Dataset):
         all_sample_lengths = []
         total_expanded_samples = 0
         
-        # Explicitly create a ProcessPoolExecutor with the specified number of workers
-        with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
-            # Submit all tasks to the executor
-            future_to_chunk = {executor.submit(process_chunk, chunk): i for i, chunk in enumerate(chunks)}
+        # Force multiprocessing to use spawn method for better compatibility
+        ctx = mp.get_context('spawn')
+        
+        print(f"🔄 Starting parallel processing with {self.num_workers} workers")
+        print(f"🔄 System has {mp.cpu_count()} CPU cores available")
+        print(f"🔄 Processing {len(chunks)} chunks in parallel")
+        
+        # Use a more direct approach with multiprocessing Pool
+        with ctx.Pool(processes=self.num_workers) as pool:
+            # Use imap_unordered for better load balancing
+            results_iter = pool.imap_unordered(process_chunk, chunks)
             
-            # Process results as they complete
-            for future in tqdm(
-                concurrent.futures.as_completed(future_to_chunk), 
+            # Process results as they arrive
+            results = []
+            for result in tqdm(
+                results_iter,
                 total=len(chunks),
                 desc=f"Processing chunks with {self.num_workers} workers",
                 unit="chunk"
             ):
-                chunk_idx = future_to_chunk[future]
-                try:
-                    offsets, sample_lengths, expanded_samples = future.result()
-                    
-                    # Adjust offsets for chunks after the first one
-                    if chunk_idx > 0 and offsets:
-                        # Calculate the correct file position
-                        chunk_start_line = chunks[chunk_idx][1]  # Start line for this chunk
-                        with open(json_path, 'rb') as f:
-                            # Skip to the start line of this chunk
-                            for _ in range(chunk_start_line):
-                                f.readline()
-                            # This is the actual position in the file
-                            actual_pos = f.tell()
-                            # Adjust all offsets in this chunk
-                            offsets = [pos - offsets[0] + actual_pos for pos in offsets]
-                    
-                    all_offsets.extend(offsets)
-                    all_sample_lengths.extend(sample_lengths)
-                    total_expanded_samples += expanded_samples
-                    
-                except Exception as e:
-                    print(f"Error processing chunk {chunk_idx}: {e}")
-                    raise
+                results.append(result)
+        
+        print(f"✅ Parallel processing complete, got {len(results)} results")
+        
+        # Process all results after parallel execution
+        for i, (offsets, sample_lengths, expanded_samples) in enumerate(results):
+            # Adjust offsets for chunks after the first one
+            if i > 0 and offsets:
+                # Calculate the correct file position
+                chunk_start_line = chunks[i][1]  # Start line for this chunk
+                with open(json_path, 'rb') as f:
+                    # Skip to the start line of this chunk
+                    for _ in range(chunk_start_line):
+                        f.readline()
+                    # This is the actual position in the file
+                    actual_pos = f.tell()
+                    # Adjust all offsets in this chunk
+                    offsets = [pos - offsets[0] + actual_pos for pos in offsets]
+            
+            all_offsets.extend(offsets)
+            all_sample_lengths.extend(sample_lengths)
+            total_expanded_samples += expanded_samples
         
         self.offsets = all_offsets
         self.sample_lengths = all_sample_lengths
@@ -520,6 +533,9 @@ def model_matches(model, state_dict):
 # ---- CLI ----
 
 if __name__ == "__main__":
+    # Set multiprocessing start method to 'spawn' for better compatibility
+    mp.set_start_method('spawn', force=True)
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--predict", action="store_true")
