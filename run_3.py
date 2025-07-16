@@ -49,20 +49,6 @@ def signal_handler(sig, frame):
 # Register signal handlers
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
-            p.terminate()
-
-# Register cleanup function
-atexit.register(cleanup_processes)
-
-# Handle termination signals
-def signal_handler(sig, frame):
-    print(f"Received signal {sig}, cleaning up processes...")
-    cleanup_processes()
-    sys.exit(1)
-
-# Register signal handlers
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"✅ Using device: {device}")
@@ -173,6 +159,18 @@ def process_chunk(chunk_info):
         import traceback
         traceback.print_exc()
         return chunk_id, [], [], 0
+def process_chunk_wrapper(chunk, result_queue):
+    """Wrapper function to put results in queue"""
+    # Set lower process priority
+    try:
+        import resource
+        resource.setpriority(resource.PRIO_PROCESS, os.getpid(), 10)
+    except (ImportError, PermissionError):
+        pass
+    
+    # Process the chunk
+    result = process_chunk(chunk)
+    result_queue.put(result)
 
 # Function to run in a separate process
 def parallel_index_builder(json_path, num_workers):
@@ -207,7 +205,8 @@ def parallel_index_builder(json_path, num_workers):
     for i, chunk in enumerate(chunks):
         p = mp.Process(
             target=process_chunk_wrapper,
-            args=(chunk, result_queue)
+            args=(chunk, result_queue),
+            daemon=True  # Set as daemon so it terminates when main process exits
         )
         
         # Try to set CPU affinity if psutil is available
@@ -220,6 +219,9 @@ def parallel_index_builder(json_path, num_workers):
                 # cpu_affinity might not be available on all platforms
                 print("CPU affinity setting not supported")
         
+        # Add to global process list for cleanup
+        _all_processes.append(p)
+        
         processes.append(p)
         p.start()
         print(f"Started process {p.pid} for chunk {i}")
@@ -231,7 +233,22 @@ def parallel_index_builder(json_path, num_workers):
     
     # Wait for all processes to finish
     for p in processes:
-        p.join()
+        p.join(timeout=5)
+        if p.is_alive():
+            print(f"Warning: Process {p.pid} did not terminate, forcing termination")
+            p.terminate()
+            p.join(timeout=1)
+            if p.is_alive():
+                print(f"Error: Could not terminate process {p.pid}")
+                try:
+                    os.kill(p.pid, signal.SIGKILL)
+                except:
+                    pass
+    
+    # Remove processes from global list
+    for p in processes:
+        if p in _all_processes:
+            _all_processes.remove(p)
     
     print(f"All {len(processes)} processes completed")
     
@@ -269,31 +286,6 @@ def parallel_index_builder(json_path, num_workers):
         cumulative_lengths.append(cumsum)
     
     return all_offsets, all_sample_lengths, cumulative_lengths, total_expanded_samples
-
-def process_chunk_wrapper(chunk, result_queue):
-    """Wrapper function to put results in queue"""
-    # Try to set higher I/O priority
-    try:
-        import os
-        import resource
-        # Set process to high priority
-        os.nice(-10)
-    except (ImportError, PermissionError):
-        pass
-    
-    # Try to set CPU affinity if psutil is available
-    try:
-        import psutil
-        p = psutil.Process()
-        # Get current CPU affinity
-        current_affinity = p.cpu_affinity()
-        print(f"Process {os.getpid()} running with CPU affinity: {current_affinity}")
-    except (ImportError, AttributeError):
-        pass
-    
-    # Process the chunk
-    result = process_chunk(chunk)
-    result_queue.put(result)
 
 # ---- Char Map ----
 
@@ -403,7 +395,6 @@ class CharGenLazyDataset(Dataset):
             print(f"⚠️ Failed to save index: {e}")
         
         print(f"✅ Dataset ready: {self.total_samples:,} samples from {len(self.offsets):,} original samples")
-        
     def load_index_direct_mp(self, index_path):
         """Load index using direct multiprocessing with explicit process creation"""
         print(f"Loading index with direct multiprocessing using {self.num_workers} workers...")
@@ -574,64 +565,6 @@ class CharGenLazyDataset(Dataset):
                         _all_processes.remove(p)
             
             raise
-                    if i >= len(processes):
-                        continue
-                        
-                    print(f"Waiting for results from process {batch_start + i}...")
-                    try:
-                        result = pipe.recv()
-                        batch_results.append(result)
-                        print(f"Received results from process {batch_start + i}")
-                    except EOFError:
-                        print(f"Error: Process {batch_start + i} closed pipe unexpectedly")
-                
-                # Wait for all processes in this batch to finish
-                for p in processes:
-                    p.join(timeout=5)  # Wait up to 5 seconds
-                    if p.is_alive():
-                        print(f"Warning: Process {p.pid} did not terminate, forcing termination")
-                        p.terminate()
-                        p.join(timeout=1)
-                        if p.is_alive():
-                            print(f"Error: Could not terminate process {p.pid}")
-                
-                # Process batch results
-                for chunk_id, offsets, sample_lengths, cumulative_lengths in batch_results:
-                    if not offsets:  # Skip empty results
-                        continue
-                        
-                    self.offsets.extend(offsets)
-                    self.sample_lengths.extend(sample_lengths)
-                    
-                    # Adjust cumulative lengths for proper concatenation
-                    if self.cumulative_lengths and cumulative_lengths:
-                        base = self.cumulative_lengths[-1]
-                        self.cumulative_lengths.extend([cl + base for cl in cumulative_lengths])
-                    else:
-                        self.cumulative_lengths.extend(cumulative_lengths)
-                
-                # Force garbage collection to free memory
-                import gc
-                gc.collect()
-                
-                print(f"Completed batch {batch_start}-{batch_end-1}, processed {len(self.offsets):,} samples so far")
-            
-            # Set total samples
-            self.total_samples = total_samples
-            print(f"All chunks processed successfully")
-            
-        except Exception as e:
-            print(f"Error during index loading: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            
-            # Clean up any remaining processes
-            for p in processes:
-                if p.is_alive():
-                    print(f"Terminating process {p.pid}")
-                    p.terminate()
-            
-            raise
     
     @staticmethod
     def _load_index_chunk_process(index_path, start_idx, end_idx, chunk_id, conn):
@@ -775,7 +708,6 @@ class CharGenLazyDataset(Dataset):
                 conn.close()
             except:
                 pass
-
     def __len__(self):
         return self.total_samples
 
@@ -834,6 +766,7 @@ class CharGenLazyDataset(Dataset):
             torch.tensor(prefix_oh, dtype=torch.float32),
             torch.tensor(next_id, dtype=torch.long)
         )
+
 # ---- Custom Activation Function ----
 
 class BiReLU(nn.Module):
@@ -1071,19 +1004,6 @@ if __name__ == "__main__":
     except RuntimeError:
         # Method already set
         pass
-    
-    # Try to install psutil if not available
-    try:
-        import psutil
-    except ImportError:
-        print("psutil not found, trying to install...")
-        try:
-            import subprocess
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "psutil"])
-            import psutil
-            print("psutil installed successfully")
-        except Exception as e:
-            print(f"Could not install psutil: {e}")
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", action="store_true")
