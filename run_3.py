@@ -164,8 +164,13 @@ def process_chunk_wrapper(chunk, result_queue):
     # Set lower process priority
     try:
         import resource
-        resource.setpriority(resource.PRIO_PROCESS, os.getpid(), 10)
-    except (ImportError, PermissionError):
+        # Check if the function exists before calling it
+        if hasattr(resource, 'nice') and callable(resource.nice):
+            resource.nice(10)
+        elif hasattr(os, 'nice') and callable(os.nice):
+            os.nice(10)
+    except (ImportError, AttributeError, PermissionError):
+        # Silently continue if the function is not available
         pass
     
     # Process the chunk
@@ -212,10 +217,11 @@ def parallel_index_builder(json_path, num_workers):
         # Try to set CPU affinity if psutil is available
         if available_cpus and i < len(available_cpus):
             try:
-                # Assign each process to a specific CPU
-                p.cpu_affinity([available_cpus[i % len(available_cpus)]])
-                print(f"Set process {i} to CPU {available_cpus[i % len(available_cpus)]}")
-            except AttributeError:
+                # Check if the function exists before calling it
+                if hasattr(p, 'cpu_affinity') and callable(p.cpu_affinity):
+                    p.cpu_affinity([available_cpus[i % len(available_cpus)]])
+                    print(f"Set process {i} to CPU {available_cpus[i % len(available_cpus)]}")
+            except (AttributeError, ImportError, PermissionError):
                 # cpu_affinity might not be available on all platforms
                 print("CPU affinity setting not supported")
         
@@ -570,11 +576,14 @@ class CharGenLazyDataset(Dataset):
     def _load_index_chunk_process(index_path, start_idx, end_idx, chunk_id, conn):
         """Process function to load a chunk of the index in a separate process"""
         try:
-            # Set lower memory priority for this process
+            # Set lower memory priority for this process - handle missing functions
             try:
                 import resource
-                resource.setpriority(resource.PRIO_PROCESS, os.getpid(), 10)
-            except (ImportError, PermissionError):
+                # Check if the function exists before calling it
+                if hasattr(resource, 'setpriority') and hasattr(resource, 'PRIO_PROCESS'):
+                    resource.setpriority(resource.PRIO_PROCESS, os.getpid(), 10)
+            except (ImportError, AttributeError, PermissionError):
+                # Silently continue if the function is not available
                 pass
                 
             # Print process info
