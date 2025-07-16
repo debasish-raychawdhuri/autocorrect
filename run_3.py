@@ -58,36 +58,45 @@ class CharGenLazyDataset(Dataset):
         self.max_word_len = max_word_len
         self.max_gen_len = max_gen_len
 
-        # Build byte offsets for all lines
-        self.offsets = []
+        # Build expanded index for all prefix combinations
+        self.samples = []
+        print("Building expanded dataset index...")
         with open(json_path, encoding="utf-8") as f:
-            pos = 0
-            for line in f:
-                self.offsets.append(pos)
-                pos += len(line.encode("utf-8"))
+            for line_idx, line in enumerate(f):
+                sample = json.loads(line.strip())
+                input_text = sample["input"].split()
+                misspelled = input_text[-1]
+                context = input_text[:-1]
+                target = sample["target"]
+                
+                # Generate all possible prefixes for this sample
+                for k in range(len(target) + 1):
+                    prefix = target[:k]
+                    next_char = target[k] if k < len(target) else "<eow>"
+                    
+                    self.samples.append({
+                        'context': context,
+                        'misspelled': misspelled,
+                        'prefix': prefix,
+                        'next_char': next_char
+                    })
+                
+                if line_idx % 10000 == 0:
+                    print(f"Processed {line_idx} lines, generated {len(self.samples)} samples")
+        
+        print(f"Total samples generated: {len(self.samples)}")
 
     def __len__(self):
-        return len(self.offsets)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        with open(self.json_path, encoding="utf-8") as f:
-            f.seek(self.offsets[idx])
-            line = f.readline()
-            sample = json.loads(line.strip())
+        sample = self.samples[idx]
         
-        # Parse input text to get context and misspelled word
-        input_text = sample["input"].split()
-        misspelled = input_text[-1]  # Last word is misspelled
-        context = input_text[:-1]    # Rest is context
-        target = sample["target"]    # Correct word
+        context = pad_context(sample['context'], self.ctx_len)
+        misspelled = sample['misspelled']
+        prefix = sample['prefix']
+        next_char = sample['next_char']
         
-        # Generate a random prefix length for this training example
-        prefix_len = random.randint(0, len(target))
-        prefix = target[:prefix_len]
-        next_char = target[prefix_len] if prefix_len < len(target) else "<eow>"
-        
-        # Process as before
-        context = pad_context(context, self.ctx_len)
         context_vec = vectorize_context(context, self.w2v_model, self.ctx_len)
         misspelled_oh = one_hot_chars(misspelled, self.char_to_id, self.max_word_len)
         prefix_oh = one_hot_chars(prefix, self.char_to_id, self.max_gen_len)
