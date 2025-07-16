@@ -311,7 +311,7 @@ class CharGenLazyDataset(Dataset):
         # Use number of CPU cores if not specified
         self.num_workers = num_workers if num_workers is not None else max(1, mp.cpu_count() - 1)
         
-        print(f"🔄 Using {self.num_workers} workers for index building/loading")
+        print(f"🔄 Using {self.num_workers} workers for index operations")
         print(f"🔄 System has {mp.cpu_count()} CPU cores available")
         
         # Check if cached index exists
@@ -320,12 +320,14 @@ class CharGenLazyDataset(Dataset):
         if os.path.exists(index_path):
             print(f"📂 Loading cached index from {index_path}")
             try:
-                # Parallelize index loading for large indices
-                self.load_index_parallel(index_path)
+                # Use direct multiprocessing for index loading
+                self.load_index_direct_mp(index_path)
                 print(f"✅ Loaded index: {self.total_samples:,} samples from {len(self.offsets):,} original samples")
                 return
             except Exception as e:
                 print(f"⚠️ Failed to load cached index: {e}")
+                import traceback
+                traceback.print_exc()
                 print("Building new index...")
 
         # Use completely separate process for index building
@@ -356,87 +358,134 @@ class CharGenLazyDataset(Dataset):
         
         print(f"✅ Dataset ready: {self.total_samples:,} samples from {len(self.offsets):,} original samples")
         
-    def load_index_parallel(self, index_path):
-        """Load index in parallel for better performance with large indices"""
-        print(f"Loading index with {self.num_workers} workers...")
+    def load_index_direct_mp(self, index_path):
+        """Load index using direct multiprocessing with explicit process creation"""
+        print(f"Loading index with direct multiprocessing using {self.num_workers} workers...")
         
-        # First load metadata to determine size
-        index_data = torch.load(index_path)
-        self.total_samples = index_data['total_samples']
-        
-        # Get sizes for partitioning
-        offsets_size = len(index_data['offsets'])
-        sample_lengths_size = len(index_data['sample_lengths'])
-        cumulative_lengths_size = len(index_data['cumulative_lengths'])
-        
-        print(f"Index contains {offsets_size:,} samples, {self.total_samples:,} expanded samples")
-        
-        # Create processes to load different parts of the arrays
-        with mp.Pool(processes=self.num_workers) as pool:
-            # Partition the arrays for parallel loading
-            chunk_size = max(1, offsets_size // self.num_workers)
+        # First load metadata to get sizes
+        print("Loading metadata...")
+        with open(index_path, 'rb') as f:
+            # Load just enough to get the metadata
+            metadata = torch.load(f)
+            total_samples = metadata['total_samples']
+            offsets_size = len(metadata['offsets'])
             
-            # Define tasks for loading different parts of the arrays
-            tasks = []
-            for i in range(self.num_workers):
-                start_idx = i * chunk_size
-                end_idx = min((i + 1) * chunk_size, offsets_size)
-                if start_idx >= end_idx:
-                    continue
+            print(f"Index contains {offsets_size:,} samples, {total_samples:,} expanded samples")
+            
+            # Clear metadata to free memory
+            del metadata
+        
+        # Create processes and pipes for communication
+        processes = []
+        pipes = []
+        
+        # Calculate chunk sizes
+        chunk_size = max(1, offsets_size // self.num_workers)
+        
+        print(f"Starting {self.num_workers} worker processes, chunk size: {chunk_size:,}")
+        
+        # Create and start processes
+        for i in range(self.num_workers):
+            # Create pipe for this process
+            parent_conn, child_conn = mp.Pipe()
+            pipes.append(parent_conn)
+            
+            # Calculate chunk range
+            start_idx = i * chunk_size
+            end_idx = min((i + 1) * chunk_size, offsets_size)
+            
+            if start_idx >= end_idx:
+                continue
                 
-                tasks.append((
-                    index_path, 
-                    start_idx, 
-                    end_idx,
-                    i
-                ))
+            # Create and start process
+            p = mp.Process(
+                target=self._load_index_chunk_process,
+                args=(index_path, start_idx, end_idx, i, child_conn)
+            )
+            processes.append(p)
+            p.start()
+            print(f"Started process {p.pid} for chunk {i} ({start_idx:,} to {end_idx:,})")
+        
+        # Collect results from all processes
+        all_results = []
+        for i, pipe in enumerate(pipes):
+            if i >= len(processes):
+                continue
+                
+            print(f"Waiting for results from process {i}...")
+            result = pipe.recv()
+            all_results.append(result)
+            print(f"Received results from process {i}")
+        
+        # Wait for all processes to finish
+        for p in processes:
+            p.join()
+        
+        print(f"All {len(processes)} processes completed")
+        
+        # Sort results by chunk_id
+        all_results.sort(key=lambda x: x[0])
+        
+        # Combine results
+        self.offsets = []
+        self.sample_lengths = []
+        self.cumulative_lengths = []
+        
+        # Process and combine results
+        for chunk_id, offsets, sample_lengths, cumulative_lengths in all_results:
+            self.offsets.extend(offsets)
+            self.sample_lengths.extend(sample_lengths)
             
-            # Execute tasks in parallel
-            results = list(tqdm(
-                pool.imap_unordered(self._load_index_chunk, tasks),
-                total=len(tasks),
-                desc="Loading index chunks"
-            ))
-            
-            # Combine results
-            self.offsets = []
-            self.sample_lengths = []
-            self.cumulative_lengths = []
-            
-            # Sort results by chunk_id
-            results.sort(key=lambda x: x[0])
-            
-            # Combine arrays
-            for _, offsets_chunk, sample_lengths_chunk, cumulative_lengths_chunk in results:
-                self.offsets.extend(offsets_chunk)
-                self.sample_lengths.extend(sample_lengths_chunk)
-                self.cumulative_lengths.extend(cumulative_lengths_chunk)
+            # Adjust cumulative lengths for proper concatenation
+            if self.cumulative_lengths and cumulative_lengths:
+                base = self.cumulative_lengths[-1]
+                self.cumulative_lengths.extend([cl + base for cl in cumulative_lengths])
+            else:
+                self.cumulative_lengths.extend(cumulative_lengths)
+        
+        # Set total samples
+        self.total_samples = total_samples
     
     @staticmethod
-    def _load_index_chunk(args):
-        """Load a chunk of the index"""
-        index_path, start_idx, end_idx, chunk_id = args
-        
-        # Load the full index
-        index_data = torch.load(index_path)
-        
-        # Extract the relevant chunks
-        offsets_chunk = index_data['offsets'][start_idx:end_idx]
-        sample_lengths_chunk = index_data['sample_lengths'][start_idx:end_idx]
-        
-        # For cumulative lengths, we need to be careful with the offsets
-        if start_idx > 0:
-            # Get the previous cumulative length as base
-            prev_cumulative = index_data['cumulative_lengths'][start_idx - 1]
-            cumulative_lengths_chunk = [
-                cl - prev_cumulative for cl in index_data['cumulative_lengths'][start_idx:end_idx]
-            ]
-        else:
-            cumulative_lengths_chunk = index_data['cumulative_lengths'][start_idx:end_idx]
-        
-        print(f"Worker {os.getpid()} loaded chunk {chunk_id}: {len(offsets_chunk)} samples")
-        
-        return chunk_id, offsets_chunk, sample_lengths_chunk, cumulative_lengths_chunk
+    def _load_index_chunk_process(index_path, start_idx, end_idx, chunk_id, conn):
+        """Process function to load a chunk of the index in a separate process"""
+        try:
+            # Print process info
+            pid = os.getpid()
+            print(f"Process {pid} (chunk {chunk_id}) starting: loading {start_idx:,} to {end_idx:,}")
+            
+            # Load the index file
+            index_data = torch.load(index_path)
+            
+            # Extract the relevant chunks
+            offsets = index_data['offsets'][start_idx:end_idx]
+            sample_lengths = index_data['sample_lengths'][start_idx:end_idx]
+            
+            # For cumulative lengths, we need to adjust based on the chunk
+            if start_idx == 0:
+                # First chunk, take as is
+                cumulative_lengths = index_data['cumulative_lengths'][start_idx:end_idx]
+            else:
+                # Subsequent chunks, adjust to start from 0
+                prev_cumulative = index_data['cumulative_lengths'][start_idx - 1]
+                cumulative_lengths = [
+                    cl - prev_cumulative for cl in index_data['cumulative_lengths'][start_idx:end_idx]
+                ]
+            
+            # Send results back through the pipe
+            conn.send((chunk_id, offsets, sample_lengths, cumulative_lengths))
+            
+            print(f"Process {pid} (chunk {chunk_id}) completed: processed {len(offsets):,} samples")
+            
+        except Exception as e:
+            print(f"ERROR in process {os.getpid()} (chunk {chunk_id}): {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Send empty results in case of error
+            conn.send((chunk_id, [], [], []))
+        finally:
+            # Close the connection
+            conn.close()
 
     def __len__(self):
         return self.total_samples
