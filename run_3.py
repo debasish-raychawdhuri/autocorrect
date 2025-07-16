@@ -12,9 +12,57 @@ import os
 import time
 from batch_sampler import BatchSamplerByChunks
 from functools import lru_cache
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
+import math
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"✅ Using device: {device}")
+
+# ---- Parallel Index Building Functions ----
+
+def count_file_lines(filename):
+    """Count the number of lines in a file efficiently"""
+    with open(filename, 'rb') as f:
+        # Count newline characters
+        return sum(1 for _ in f)
+
+def process_chunk(args):
+    """Process a chunk of the file to build partial index"""
+    filename, start_line, end_line = args
+    
+    offsets = []
+    sample_lengths = []
+    total_expanded_samples = 0
+    
+    with open(filename, 'rb') as f:
+        # Skip to start_line
+        for _ in range(start_line):
+            f.readline()
+        
+        # Process assigned chunk
+        pos = f.tell()
+        for _ in range(end_line - start_line):
+            line = f.readline()
+            if not line:  # End of file
+                break
+                
+            offsets.append(pos)
+            pos += len(line)
+            
+            # Count prefix samples this line will generate
+            try:
+                sample = json.loads(line.strip().decode('utf-8'))
+                target = sample["target"]
+                prefix_count = len(target) + 1  # +1 for the <eow> case
+                sample_lengths.append(prefix_count)
+                total_expanded_samples += prefix_count
+            except Exception as e:
+                # Handle corrupted lines
+                sample_lengths.append(1)
+                total_expanded_samples += 1
+    
+    return offsets, sample_lengths, total_expanded_samples
 
 # ---- Char Map ----
 
@@ -61,14 +109,18 @@ def vectorize_context(context_words, w2v_model, ctx_len=10, embed_dim=300):
 # ---- Lazy Dataset ----
 
 class CharGenLazyDataset(Dataset):
-    def __init__(self, json_path, w2v_model, char_to_id, ctx_len=10, max_word_len=50, max_gen_len=50):
+    def __init__(self, json_path, w2v_model, char_to_id, ctx_len=10, max_word_len=50, max_gen_len=50, num_workers=None):
         self.json_path = json_path
         self.w2v_model = w2v_model
         self.char_to_id = char_to_id
         self.ctx_len = ctx_len
         self.max_word_len = max_word_len
         self.max_gen_len = max_gen_len
-
+        
+        # Use number of CPU cores if not specified
+        if num_workers is None:
+            num_workers = max(1, mp.cpu_count() - 1)
+        
         # Check if cached index exists
         index_path = f"{json_path}.index"
         
@@ -87,19 +139,75 @@ class CharGenLazyDataset(Dataset):
                 print(f"⚠️ Failed to load cached index: {e}")
                 print("Building new index...")
 
-        # Build byte offsets for all lines (original samples)
-        self.offsets = []
-        self.sample_lengths = []  # Track how many prefix samples each original sample generates
-        
         # Count total lines first for progress bar
         print("Counting lines in dataset...")
-        with open(json_path, 'r', encoding='utf-8') as f:
-            total_lines = sum(1 for _ in f)
+        total_lines = count_file_lines(json_path)
+        print(f"Found {total_lines:,} lines in dataset")
         
-        print("Building sample index...")
-        with open(json_path, encoding="utf-8") as f:
-            pos = 0
-            total_expanded_samples = 0
+        # Parallel processing of file chunks
+        print(f"Building sample index using {num_workers} workers...")
+        
+        # Split the file into chunks for parallel processing
+        chunk_size = math.ceil(total_lines / num_workers)
+        chunks = [(json_path, i * chunk_size, min((i + 1) * chunk_size, total_lines)) 
+                 for i in range(num_workers)]
+        
+        # Process chunks in parallel
+        all_offsets = []
+        all_sample_lengths = []
+        total_expanded_samples = 0
+        
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            results = list(tqdm(
+                executor.map(process_chunk, chunks),
+                total=len(chunks),
+                desc="Processing chunks",
+                unit="chunk"
+            ))
+            
+            # Combine results
+            for offsets, sample_lengths, expanded_samples in results:
+                # Adjust offsets for chunks after the first one
+                if all_offsets:
+                    # Find the correct starting position
+                    with open(json_path, 'rb') as f:
+                        if offsets:
+                            f.seek(offsets[0])
+                            # This is the actual position in the file
+                            actual_pos = offsets[0]
+                            offsets = [pos + actual_pos for pos in offsets]
+                
+                all_offsets.extend(offsets)
+                all_sample_lengths.extend(sample_lengths)
+                total_expanded_samples += expanded_samples
+        
+        self.offsets = all_offsets
+        self.sample_lengths = all_sample_lengths
+        
+        # Build cumulative index to map global sample index to (line_idx, prefix_idx)
+        print("Building cumulative index...")
+        self.cumulative_lengths = []
+        cumsum = 0
+        for length in tqdm(self.sample_lengths, desc="Building index", unit="samples"):
+            cumsum += length
+            self.cumulative_lengths.append(cumsum)
+        
+        self.total_samples = total_expanded_samples
+        
+        # Save the index for future use
+        print(f"💾 Saving index to {index_path}")
+        try:
+            torch.save({
+                'offsets': self.offsets,
+                'sample_lengths': self.sample_lengths,
+                'cumulative_lengths': self.cumulative_lengths,
+                'total_samples': self.total_samples
+            }, index_path)
+            print(f"✅ Index saved successfully")
+        except Exception as e:
+            print(f"⚠️ Failed to save index: {e}")
+        
+        print(f"✅ Dataset ready: {self.total_samples:,} samples from {len(self.offsets):,} original samples")
             
             # Create progress bar for indexing
             pbar = tqdm(total=total_lines, desc="Indexing samples", unit="samples")
@@ -244,16 +352,23 @@ class ResNetFFN(nn.Module):
 def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocorrect.pt"):
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
-    scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+    
+    # Fix for FutureWarning about GradScaler
+    try:
+        # New API (PyTorch 2.0+)
+        scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
+    except TypeError:
+        # Fallback to old API
+        scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
     
     # Track metrics for early stopping and learning rate scheduling
     best_loss = float('inf')
     patience_counter = 0
     max_patience = 3
     
-    # Learning rate scheduler
+    # Learning rate scheduler - removed verbose parameter
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=1, verbose=True
+        optimizer, mode='min', factor=0.5, patience=1
     )
     
     for epoch in range(epochs):
@@ -272,9 +387,16 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
             
             # Mixed precision training if available
             if scaler is not None:
-                with torch.cuda.amp.autocast():
-                    logits = model(context_vec, misspelled_oh, prefix_oh)
-                    loss = F.cross_entropy(logits, next_id)
+                try:
+                    # Try new API first
+                    with torch.amp.autocast('cuda'):
+                        logits = model(context_vec, misspelled_oh, prefix_oh)
+                        loss = F.cross_entropy(logits, next_id)
+                except (AttributeError, TypeError):
+                    # Fall back to old API
+                    with torch.cuda.amp.autocast():
+                        logits = model(context_vec, misspelled_oh, prefix_oh)
+                        loss = F.cross_entropy(logits, next_id)
                 
                 optimizer.zero_grad()
                 scaler.scale(loss).backward()
@@ -435,6 +557,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="char_autocorrect.pt")
     parser.add_argument("--chunk_size", type=int, default=1000000, help="Number of samples to process in each chunk")
     parser.add_argument("--num_workers", type=int, default=8, help="Number of worker processes for data loading")
+    parser.add_argument("--index_workers", type=int, default=None, help="Number of worker processes for index building (default: CPU count - 1)")
     args = parser.parse_args()
 
     from gensim.models import KeyedVectors
@@ -483,7 +606,8 @@ if __name__ == "__main__":
 
         # Now proceed to dataset and training as before
         dataset = CharGenLazyDataset(args.data, w2v_model, char_to_id,
-                                ctx_len=args.ctx_len, max_word_len=args.max_word_len, max_gen_len=args.max_gen_len)
+                                ctx_len=args.ctx_len, max_word_len=args.max_word_len, 
+                                max_gen_len=args.max_gen_len, num_workers=args.index_workers)
         
         # Use custom batch sampler to process data in chunks
         batch_sampler = BatchSamplerByChunks(
