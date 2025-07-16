@@ -13,7 +13,6 @@ import time
 import sys
 import signal
 import atexit
-import glob
 from batch_sampler import BatchSamplerByChunks
 from functools import lru_cache
 import multiprocessing as mp
@@ -37,22 +36,6 @@ def cleanup_processes():
                     os.kill(p.pid, signal.SIGKILL)
             except Exception as e:
                 print(f"Error terminating process {p.pid}: {e}")
-    
-    # Clean up any temporary files
-    cleanup_temp_files()
-
-def cleanup_temp_files():
-    """Clean up any temporary files created for data transfer"""
-    try:
-        # Remove all temporary files created by our processes
-        for temp_file in glob.glob("/tmp/index_chunk_*.pkl"):
-            try:
-                os.remove(temp_file)
-                print(f"Removed temporary file: {temp_file}")
-            except:
-                pass
-    except Exception as e:
-        print(f"Error cleaning up temporary files: {e}")
 
 # Register cleanup function
 atexit.register(cleanup_processes)
@@ -427,171 +410,128 @@ class CharGenLazyDataset(Dataset):
         self.sample_lengths = []
         self.cumulative_lengths = []
         
-        # First load metadata to get sizes
-        print("Loading metadata...")
-        with open(index_path, 'rb') as f:
-            # Load just enough to get the metadata
-            metadata = torch.load(f)
-            total_samples = metadata['total_samples']
-            offsets_size = len(metadata['offsets'])
-            
-            print(f"Index contains {offsets_size:,} samples, {total_samples:,} expanded samples")
-            
-            # Clear metadata to free memory
-            del metadata
+        # First load the entire index in the main process
+        print("Loading index data in main process...")
+        index_data = torch.load(index_path, map_location='cpu')
+        total_samples = index_data['total_samples']
+        offsets_size = len(index_data['offsets'])
         
-        # Calculate chunk sizes - use more chunks than workers to reduce memory per process
-        num_chunks = self.num_workers * 3  # Use more chunks to reduce memory per process
+        print(f"Index contains {offsets_size:,} samples, {total_samples:,} expanded samples")
+        
+        # Calculate chunk sizes for processing
+        num_chunks = self.num_workers
         chunk_size = max(1, offsets_size // num_chunks)
         
         print(f"Starting with {num_chunks} chunks, chunk size: {chunk_size:,}")
         
-        # Create overall progress bar for all chunks
+        # Create a shared queue for results
+        result_queue = mp.Queue()
+        
+        # Create overall progress bar
         overall_progress = tqdm(
             total=offsets_size,
-            desc="Overall index loading progress",
+            desc="Processing index data",
             unit="samples"
         )
         
+        # Process chunks in parallel
+        processes = []
+        
         try:
-            # Process chunks in batches to limit memory usage
-            batch_ranges = list(range(0, num_chunks, self.num_workers))
-            for batch_idx, batch_start in enumerate(batch_ranges):
-                batch_end = min(batch_start + self.num_workers, num_chunks)
-                active_workers = batch_end - batch_start
+            # Create and start processes for all chunks
+            for i in range(num_chunks):
+                # Calculate chunk range
+                start_idx = i * chunk_size
+                end_idx = min((i + 1) * chunk_size, offsets_size)
                 
-                print(f"Processing batch {batch_idx+1}/{len(batch_ranges)}: {active_workers} chunks ({batch_start} to {batch_end-1})")
+                if start_idx >= end_idx:
+                    continue
                 
-                # Clear previous batch data
-                processes = []
-                pipes = []
+                # Create process arguments - only pass the necessary data
+                chunk_data = {
+                    'offsets': index_data['offsets'][start_idx:end_idx],
+                    'sample_lengths': index_data['sample_lengths'][start_idx:end_idx],
+                    'cumulative_lengths': None
+                }
                 
-                # Create and start processes for this batch
-                for i in range(batch_start, batch_end):
-                    # Create pipe for this process
-                    parent_conn, child_conn = mp.Pipe()
-                    pipes.append(parent_conn)
-                    
-                    # Calculate chunk range
-                    start_idx = i * chunk_size
-                    end_idx = min((i + 1) * chunk_size, offsets_size)
-                    
-                    if start_idx >= end_idx:
-                        continue
-                        
-                    # Create and start process with daemon=True
-                    p = mp.Process(
-                        target=self._load_index_chunk_process,
-                        args=(index_path, start_idx, end_idx, i, child_conn),
-                        daemon=True  # Set as daemon so it terminates when main process exits
-                    )
-                    
-                    # Add to global process list for cleanup
-                    _all_processes.append(p)
-                    
-                    processes.append(p)
-                    p.start()
-                    print(f"Started process {p.pid} for chunk {i} ({start_idx:,} to {end_idx:,})")
+                # Handle cumulative lengths
+                if start_idx == 0:
+                    # First chunk, take as is
+                    chunk_data['cumulative_lengths'] = index_data['cumulative_lengths'][start_idx:end_idx]
+                elif start_idx < len(index_data['cumulative_lengths']):
+                    # Subsequent chunks, adjust to start from 0
+                    prev_cumulative = index_data['cumulative_lengths'][start_idx - 1]
+                    chunk_data['cumulative_lengths'] = [
+                        cl - prev_cumulative for cl in index_data['cumulative_lengths'][start_idx:end_idx]
+                    ]
                 
-                # Create progress bar for this batch
-                batch_progress = tqdm(
-                    total=len(processes),
-                    desc=f"Batch {batch_idx+1}/{len(batch_ranges)}",
-                    unit="chunks"
+                # Create and start process
+                p = mp.Process(
+                    target=self._process_index_chunk,
+                    args=(i, chunk_data, result_queue),
+                    daemon=True
                 )
                 
-                # Collect results from all processes in this batch with timeout
-                batch_results = []
-                for i, pipe in enumerate(pipes):
-                    if i >= len(processes):
-                        continue
-                    
-                    try:
-                        # Set a timeout for receiving data
-                        if pipe.poll(30):  # Wait up to 30 seconds
-                            # Receive the temporary file path
-                            temp_file_path = pipe.recv()
-                            
-                            # Load the data from the temporary file
-                            import pickle
-                            with open(temp_file_path, 'rb') as f:
-                                result = pickle.load(f)
-                                batch_results.append(result)
-                            
-                            # Delete the temporary file
-                            try:
-                                os.remove(temp_file_path)
-                            except:
-                                pass
-                            
-                            # Update progress bars
-                            batch_progress.update(1)
-                            chunk_id, offsets, sample_lengths, _ = result
-                            overall_progress.update(len(offsets))
-                        else:
-                            print(f"Timeout waiting for process {batch_start + i}")
-                    except EOFError:
-                        print(f"Error: Process {batch_start + i} closed pipe unexpectedly")
-                    except Exception as e:
-                        print(f"Error receiving results from process {batch_start + i}: {e}")
-                        import traceback
-                        traceback.print_exc()
+                # Add to global process list for cleanup
+                _all_processes.append(p)
                 
-                # Close batch progress bar
-                batch_progress.close()
-                
-                # Wait for all processes in this batch to finish
-                for p in processes:
-                    p.join(timeout=5)  # Wait up to 5 seconds
+                processes.append(p)
+                p.start()
+                print(f"Started process {p.pid} for chunk {i} ({start_idx:,} to {end_idx:,})")
+            
+            # Collect results from all processes
+            results = []
+            for _ in range(len(processes)):
+                try:
+                    chunk_id, offsets, sample_lengths, cumulative_lengths = result_queue.get(timeout=30)
+                    results.append((chunk_id, offsets, sample_lengths, cumulative_lengths))
+                    overall_progress.update(len(offsets))
+                except Exception as e:
+                    print(f"Error collecting results: {e}")
+            
+            # Wait for all processes to finish
+            for p in processes:
+                p.join(timeout=5)
+                if p.is_alive():
+                    print(f"Warning: Process {p.pid} did not terminate, forcing termination")
+                    p.terminate()
+                    p.join(timeout=1)
                     if p.is_alive():
-                        print(f"Warning: Process {p.pid} did not terminate, forcing termination")
-                        p.terminate()
-                        p.join(timeout=1)
-                        if p.is_alive():
-                            print(f"Error: Could not terminate process {p.pid}")
-                            try:
-                                os.kill(p.pid, signal.SIGKILL)
-                            except:
-                                pass
-                
-                # Remove processed workers from global list
-                for p in processes:
-                    if p in _all_processes:
-                        _all_processes.remove(p)
-                
-                # Process batch results
-                for chunk_id, offsets, sample_lengths, cumulative_lengths in batch_results:
-                    if not offsets:  # Skip empty results
-                        continue
-                        
-                    self.offsets.extend(offsets)
-                    self.sample_lengths.extend(sample_lengths)
-                    
-                    # Adjust cumulative lengths for proper concatenation
-                    if self.cumulative_lengths and cumulative_lengths:
-                        base = self.cumulative_lengths[-1]
-                        self.cumulative_lengths.extend([cl + base for cl in cumulative_lengths])
-                    else:
-                        self.cumulative_lengths.extend(cumulative_lengths)
-                
-                # Force garbage collection to free memory
-                import gc
-                gc.collect()
-                
-                print(f"Completed batch {batch_idx+1}/{len(batch_ranges)}, processed {len(self.offsets):,} samples so far")
+                        print(f"Error: Could not terminate process {p.pid}")
+                        try:
+                            os.kill(p.pid, signal.SIGKILL)
+                        except:
+                            pass
             
-            # Close overall progress bar
+            # Remove processes from global list
+            for p in processes:
+                if p in _all_processes:
+                    _all_processes.remove(p)
+            
+            # Sort results by chunk_id
+            results.sort(key=lambda x: x[0])
+            
+            # Process results
+            for chunk_id, offsets, sample_lengths, cumulative_lengths in results:
+                self.offsets.extend(offsets)
+                self.sample_lengths.extend(sample_lengths)
+                
+                # Adjust cumulative lengths for proper concatenation
+                if self.cumulative_lengths and cumulative_lengths:
+                    base = self.cumulative_lengths[-1]
+                    self.cumulative_lengths.extend([cl + base for cl in cumulative_lengths])
+                else:
+                    self.cumulative_lengths.extend(cumulative_lengths)
+            
+            # Close progress bar
             overall_progress.close()
-            
-            # Clean up any temporary files that might be left
-            cleanup_temp_files()
             
             # Set total samples
             self.total_samples = total_samples
             print(f"All chunks processed successfully")
             
         except Exception as e:
-            # Close progress bars in case of error
+            # Close progress bar in case of error
             overall_progress.close()
             
             print(f"Error during index loading: {str(e)}")
@@ -610,84 +550,43 @@ class CharGenLazyDataset(Dataset):
             raise
     
     @staticmethod
-    def _load_index_chunk_process(index_path, start_idx, end_idx, chunk_id, conn):
-        """Process function to load a chunk of the index in a separate process"""
+    def _process_index_chunk(chunk_id, chunk_data, result_queue):
+        """Process a chunk of the index data"""
         try:
-            # Set lower memory priority for this process - handle missing functions
+            # Set lower process priority if possible
             try:
                 import resource
-                # Check if the function exists before calling it
-                if hasattr(resource, 'setpriority') and hasattr(resource, 'PRIO_PROCESS'):
-                    resource.setpriority(resource.PRIO_PROCESS, os.getpid(), 10)
+                if hasattr(resource, 'nice') and callable(resource.nice):
+                    resource.nice(10)
+                elif hasattr(os, 'nice') and callable(os.nice):
+                    os.nice(10)
             except (ImportError, AttributeError, PermissionError):
-                # Silently continue if the function is not available
                 pass
-                
+            
             # Print process info
             pid = os.getpid()
-            print(f"Process {pid} (chunk {chunk_id}) starting: loading {start_idx:,} to {end_idx:,}")
+            print(f"Process {pid} (chunk {chunk_id}) processing data")
             
-            # Load only the needed part of the index to reduce memory usage
-            offsets = []
-            sample_lengths = []
-            cumulative_lengths = []
+            # Extract data from chunk
+            offsets = chunk_data['offsets']
+            sample_lengths = chunk_data['sample_lengths']
+            cumulative_lengths = chunk_data['cumulative_lengths']
             
-            # Create a progress bar for this worker
-            worker_progress = tqdm(
-                total=100,  # We'll update based on percentage
-                desc=f"Worker {pid} (chunk {chunk_id})",
-                position=chunk_id % 10,  # Stagger progress bars
-                leave=False  # Don't leave the progress bar when done
-            )
+            # Create a progress bar
+            with tqdm(
+                total=len(offsets),
+                desc=f"Chunk {chunk_id}",
+                position=chunk_id % 10,
+                leave=False
+            ) as pbar:
+                # Process the data (in this case, just pass it through)
+                # This is where you would do any processing if needed
+                
+                # Update progress bar
+                pbar.update(len(offsets))
             
-            # Use torch.load with map_location='cpu' to ensure it loads on CPU
-            worker_progress.update(10)
-            index_data = torch.load(index_path, map_location='cpu')
-            worker_progress.update(40)
-            
-            # Extract the relevant chunks
-            offsets = index_data['offsets'][start_idx:end_idx]
-            worker_progress.update(10)
-            
-            sample_lengths = index_data['sample_lengths'][start_idx:end_idx]
-            worker_progress.update(10)
-            
-            # For cumulative lengths, we need to adjust based on the chunk
-            if start_idx == 0:
-                # First chunk, take as is
-                cumulative_lengths = index_data['cumulative_lengths'][start_idx:end_idx]
-            elif start_idx < len(index_data['cumulative_lengths']):
-                # Subsequent chunks, adjust to start from 0
-                prev_cumulative = index_data['cumulative_lengths'][start_idx - 1]
-                cumulative_lengths = [
-                    cl - prev_cumulative for cl in index_data['cumulative_lengths'][start_idx:end_idx]
-                ]
-            worker_progress.update(20)
-            
-            # Clear data to free memory
-            del index_data
-            worker_progress.update(10)
-            
-            # Force garbage collection before sending results
-            import gc
-            gc.collect()
-            
-            # Complete the progress bar
-            worker_progress.close()
-            
-            # Instead of sending through pipe, save to a temporary file
-            import tempfile
-            import pickle
-            
-            # Create a temporary file with a unique name based on chunk_id
-            temp_file = f"/tmp/index_chunk_{chunk_id}_{pid}.pkl"
-            
-            # Save the data to the temporary file
-            with open(temp_file, 'wb') as f:
-                pickle.dump((chunk_id, offsets, sample_lengths, cumulative_lengths), f)
-            
-            # Send just the file path through the pipe
-            conn.send(temp_file)
+            # Put results in queue
+            result_queue.put((chunk_id, offsets, sample_lengths, cumulative_lengths))
             
             print(f"Process {pid} (chunk {chunk_id}) completed: processed {len(offsets):,} samples")
             
@@ -696,20 +595,7 @@ class CharGenLazyDataset(Dataset):
             import traceback
             traceback.print_exc()
             # Send empty results in case of error
-            try:
-                # Create an empty temporary file
-                temp_file = f"/tmp/index_chunk_{chunk_id}_{os.getpid()}_error.pkl"
-                with open(temp_file, 'wb') as f:
-                    pickle.dump((chunk_id, [], [], []), f)
-                conn.send(temp_file)
-            except:
-                pass
-        finally:
-            # Close the connection
-            try:
-                conn.close()
-            except:
-                pass
+            result_queue.put((chunk_id, [], [], []))
     def __len__(self):
         return self.total_samples
 
