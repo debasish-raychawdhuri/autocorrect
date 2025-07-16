@@ -208,37 +208,6 @@ class CharGenLazyDataset(Dataset):
             print(f"⚠️ Failed to save index: {e}")
         
         print(f"✅ Dataset ready: {self.total_samples:,} samples from {len(self.offsets):,} original samples")
-                
-                # Update progress bar
-                pbar.update(1)
-                pbar.set_postfix(expanded_samples=f"{total_expanded_samples:,}")
-            
-            pbar.close()
-        
-        # Build cumulative index to map global sample index to (line_idx, prefix_idx)
-        print("Building cumulative index...")
-        self.cumulative_lengths = []
-        cumsum = 0
-        for length in tqdm(self.sample_lengths, desc="Building index", unit="samples"):
-            cumsum += length
-            self.cumulative_lengths.append(cumsum)
-        
-        self.total_samples = total_expanded_samples
-        
-        # Save the index for future use
-        print(f"💾 Saving index to {index_path}")
-        try:
-            torch.save({
-                'offsets': self.offsets,
-                'sample_lengths': self.sample_lengths,
-                'cumulative_lengths': self.cumulative_lengths,
-                'total_samples': self.total_samples
-            }, index_path)
-            print(f"✅ Index saved successfully")
-        except Exception as e:
-            print(f"⚠️ Failed to save index: {e}")
-        
-        print(f"✅ Dataset ready: {self.total_samples:,} samples from {len(self.offsets):,} original samples")
 
     def __len__(self):
         return self.total_samples
