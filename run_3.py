@@ -11,6 +11,7 @@ import string
 import os
 import time
 import sys
+import psutil
 from batch_sampler import BatchSamplerByChunks
 from functools import lru_cache
 import multiprocessing as mp
@@ -481,6 +482,17 @@ class ResNetFFN(nn.Module):
 # ---- Training & Prediction ----
 
 def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocorrect.pt"):
+    # Print memory usage before training starts
+    try:
+        import psutil
+        process = psutil.Process(os.getpid())
+        print(f"Memory usage before training: {process.memory_info().rss / (1024 * 1024):.2f} MB")
+        print(f"Number of CPU cores: {psutil.cpu_count()}")
+        print(f"Available memory: {psutil.virtual_memory().available / (1024 * 1024):.2f} MB")
+        print(f"Total memory: {psutil.virtual_memory().total / (1024 * 1024):.2f} MB")
+    except ImportError:
+        print("psutil not available for memory monitoring")
+    
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
     
@@ -502,61 +514,88 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
         optimizer, mode='min', factor=0.5, patience=1
     )
     
+    print("Starting training loop...")
+    
     for epoch in range(epochs):
         epoch_loss = 0.0
         batch_count = 0
         start_time = time.time()
         
-        loop = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}", unit="batch")
+        print(f"Starting epoch {epoch+1}/{epochs}")
         
-        for context_vec, misspelled_oh, prefix_oh, next_id in loop:
-            # Move data to device
-            context_vec = context_vec.to(device, non_blocking=True)
-            misspelled_oh = misspelled_oh.to(device, non_blocking=True)
-            prefix_oh = prefix_oh.to(device, non_blocking=True)
-            next_id = next_id.to(device, non_blocking=True)
+        # Print memory usage before creating the loop
+        try:
+            print(f"Memory usage before dataloader iteration: {process.memory_info().rss / (1024 * 1024):.2f} MB")
+            print(f"Available memory: {psutil.virtual_memory().available / (1024 * 1024):.2f} MB")
+        except:
+            pass
+        
+        try:
+            loop = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}", unit="batch")
             
-            # Mixed precision training if available
-            if scaler is not None:
-                try:
-                    # Try new API first
-                    with torch.amp.autocast('cuda'):
-                        logits = model(context_vec, misspelled_oh, prefix_oh)
-                        loss = F.cross_entropy(logits, next_id)
-                except (AttributeError, TypeError):
-                    # Fall back to old API
-                    with torch.cuda.amp.autocast():
-                        logits = model(context_vec, misspelled_oh, prefix_oh)
-                        loss = F.cross_entropy(logits, next_id)
+            print("Created tqdm loop, starting iteration...")
+            
+            for batch_idx, (context_vec, misspelled_oh, prefix_oh, next_id) in enumerate(loop):
+                # Print memory usage for first few batches
+                if batch_idx < 3:
+                    try:
+                        print(f"Batch {batch_idx+1} memory: {process.memory_info().rss / (1024 * 1024):.2f} MB")
+                        print(f"Available memory: {psutil.virtual_memory().available / (1024 * 1024):.2f} MB")
+                    except:
+                        pass
                 
-                optimizer.zero_grad()
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                # Standard training
-                logits = model(context_vec, misspelled_oh, prefix_oh)
-                loss = F.cross_entropy(logits, next_id)
+                # Move data to device
+                context_vec = context_vec.to(device, non_blocking=True)
+                misspelled_oh = misspelled_oh.to(device, non_blocking=True)
+                prefix_oh = prefix_oh.to(device, non_blocking=True)
+                next_id = next_id.to(device, non_blocking=True)
                 
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-            
-            # Update metrics
-            batch_loss = loss.item()
-            epoch_loss += batch_loss
-            batch_count += 1
-            
-            # Update progress bar with more info
-            loop.set_postfix(
-                loss=f"{batch_loss:.4f}", 
-                avg=f"{epoch_loss/batch_count:.4f}",
-                lr=f"{optimizer.param_groups[0]['lr']:.6f}",
-                time=f"{(time.time()-start_time)/60:.1f}m"
-            )
+                # Mixed precision training if available
+                if scaler is not None:
+                    try:
+                        # Try new API first
+                        with torch.amp.autocast('cuda'):
+                            logits = model(context_vec, misspelled_oh, prefix_oh)
+                            loss = F.cross_entropy(logits, next_id)
+                    except (AttributeError, TypeError):
+                        # Fall back to old API
+                        with torch.cuda.amp.autocast():
+                            logits = model(context_vec, misspelled_oh, prefix_oh)
+                            loss = F.cross_entropy(logits, next_id)
+                    
+                    optimizer.zero_grad()
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    # Standard training
+                    logits = model(context_vec, misspelled_oh, prefix_oh)
+                    loss = F.cross_entropy(logits, next_id)
+                    
+                    optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                
+                # Update metrics
+                batch_loss = loss.item()
+                epoch_loss += batch_loss
+                batch_count += 1
+                
+                # Update progress bar with more info
+                loop.set_postfix(
+                    loss=f"{batch_loss:.4f}", 
+                    avg=f"{epoch_loss/batch_count:.4f}",
+                    lr=f"{optimizer.param_groups[0]['lr']:.6f}",
+                    time=f"{(time.time()-start_time)/60:.1f}m"
+                )
+        except Exception as e:
+            print(f"Exception during training: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
         
         # End of epoch
         avg_loss = epoch_loss / batch_count
@@ -772,16 +811,50 @@ if __name__ == "__main__":
             shuffle=True
         )
         
-        # Use more workers to keep CPU busy and GPU fed
-        dataloader = DataLoader(
-            dataset, 
-            batch_sampler=batch_sampler,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            prefetch_factor=2  # Prefetch 2 batches per worker
-        )
+        print(f"Created batch sampler with {len(batch_sampler)} batches")
+        print(f"Dataset size: {len(dataset):,} samples")
+        print(f"Batch size: {args.batch_size}")
+        print(f"Chunk size: {args.chunk_size:,}")
         
-        train_model(model, dataloader, vocab_size=char_vocab_size, epochs=args.epochs, save_path=args.model)   
+        # Print memory usage before creating DataLoader
+        try:
+            import psutil
+            process = psutil.Process(os.getpid())
+            print(f"Memory usage before DataLoader creation: {process.memory_info().rss / (1024 * 1024):.2f} MB")
+            print(f"Available memory: {psutil.virtual_memory().available / (1024 * 1024):.2f} MB")
+        except ImportError:
+            print("psutil not available for memory monitoring")
+        
+        # Use more workers to keep CPU busy and GPU fed
+        print(f"Creating DataLoader with {args.num_workers} workers...")
+        
+        try:
+            dataloader = DataLoader(
+                dataset, 
+                batch_sampler=batch_sampler,
+                num_workers=args.num_workers,
+                pin_memory=True,
+                prefetch_factor=2,  # Prefetch 2 batches per worker
+                persistent_workers=True  # Keep worker processes alive between iterations
+            )
+            
+            print("DataLoader created successfully")
+            
+            # Print memory usage after creating DataLoader
+            try:
+                print(f"Memory usage after DataLoader creation: {process.memory_info().rss / (1024 * 1024):.2f} MB")
+                print(f"Available memory: {psutil.virtual_memory().available / (1024 * 1024):.2f} MB")
+            except:
+                pass
+            
+            print("Starting training...")
+            train_model(model, dataloader, vocab_size=char_vocab_size, epochs=args.epochs, save_path=args.model)
+            
+        except Exception as e:
+            print(f"Exception during DataLoader creation or training: {e}")
+            import traceback
+            traceback.print_exc()
+            raise   
     elif args.predict:
         model.load_state_dict(torch.load(args.model, map_location=device))
         model.eval()
