@@ -18,7 +18,11 @@ def smart_tokenize(text):
     return re.findall(r"\w+(?:'\w+)?|[^\w\s]", text)
 
 def random_corrupt(word):
-    """Introduce a random error in the word"""
+    """Introduce a random error in the word, with 20% chance of no error"""
+    # 20% chance to return the word unchanged (no error)
+    if random.random() < 0.2:
+        return word
+        
     if len(word) == 0:
         return word
     op = random.choice(["insert", "delete", "substitute", "transpose"])
@@ -53,34 +57,29 @@ def generate_error_samples(line):
     samples = []
     used = set()
 
-    # Try to generate exactly ERRORS_PER_SAMPLE unique corrupted versions
+    # Try to generate exactly ERRORS_PER_SAMPLE versions (which may include unchanged words)
     attempts = 0
     max_attempts = 20  # Limit attempts to avoid infinite loops
     
     while len(samples) < ERRORS_PER_SAMPLE and attempts < max_attempts:
         corrupted = random_corrupt(last_word)
         attempts += 1
-        if corrupted != last_word and corrupted not in used:
+        
+        # Now we accept both changed and unchanged words, but avoid duplicates
+        if corrupted not in used:
             used.add(corrupted)
             samples.append({
                 "input": " ".join(prefix + [corrupted]),
                 "target": last_word
             })
 
-    # If we couldn't generate enough unique corrupted versions, fill with duplicates
-    # This is rare but ensures we always have exactly ERRORS_PER_SAMPLE samples
+    # If we couldn't generate enough unique versions, fill with additional samples
     while len(samples) < ERRORS_PER_SAMPLE:
         corrupted = random_corrupt(last_word)
         samples.append({
             "input": " ".join(prefix + [corrupted]),
             "target": last_word
         })
-
-    # Add clean version (optional - comment out if not needed)
-    samples.append({
-        "input": line,
-        "target": last_word
-    })
 
     return samples
 
