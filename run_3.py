@@ -11,6 +11,7 @@ import string
 import os
 import time
 from batch_sampler import BatchSamplerByChunks
+from functools import lru_cache
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"✅ Using device: {device}")
@@ -27,25 +28,34 @@ def create_charmap():
 # ---- Input Preparation ----
 
 def one_hot_chars(seq, char_to_id, max_len):
-    arr = np.zeros((max_len, len(char_to_id)), dtype=np.float32)
-    seq = seq[-max_len:]
+    """Optimized one-hot encoding using numpy operations"""
+    char_vocab_size = len(char_to_id)
+    arr = np.zeros((max_len, char_vocab_size), dtype=np.float32)
+    seq = seq[-max_len:]  # Truncate if too long
+    
+    # Process in reverse order to match original behavior
     for i, c in enumerate(seq[::-1]):
         idx = char_to_id.get(c, 0)
         arr[max_len - 1 - i, idx] = 1.0
-    return arr.flatten()
+    
+    return arr.reshape(-1)  # Flatten
 
-def pad_context(words, ctx_len=10):
-    return [""] * max(0, ctx_len - len(words)) + words[-ctx_len:]
+@lru_cache(maxsize=100000)
+def get_word_vector(word, w2v_model, embed_dim=300):
+    """Cached word vector lookup to avoid repeated computation"""
+    if word in w2v_model:
+        return w2v_model[word]
+    return np.zeros(embed_dim)
 
 def vectorize_context(context_words, w2v_model, ctx_len=10, embed_dim=300):
+    """Vectorize context with cached word vectors"""
     vecs = []
     for word in context_words[-ctx_len:]:
-        if word in w2v_model:
-            vecs.append(w2v_model[word])
-        else:
-            vecs.append(np.zeros(embed_dim))
+        vecs.append(get_word_vector(word, w2v_model, embed_dim))
+    
     while len(vecs) < ctx_len:
         vecs.insert(0, np.zeros(embed_dim))
+    
     return np.concatenate(vecs, axis=0)
 
 # ---- Lazy Dataset ----
@@ -140,20 +150,27 @@ class CharGenLazyDataset(Dataset):
         return self.total_samples
 
     def __getitem__(self, idx):
-        # Find which original sample and which prefix this idx corresponds to
-        line_idx = 0
-        for i, cumsum in enumerate(self.cumulative_lengths):
-            if idx < cumsum:
-                line_idx = i
+        # Binary search to find which original sample and which prefix this idx corresponds to
+        left, right = 0, len(self.cumulative_lengths) - 1
+        while left <= right:
+            mid = (left + right) // 2
+            if mid > 0 and self.cumulative_lengths[mid-1] <= idx < self.cumulative_lengths[mid]:
+                line_idx = mid
                 break
+            elif idx < self.cumulative_lengths[mid]:
+                right = mid - 1
+            else:
+                left = mid + 1
+        else:
+            line_idx = 0  # Fallback
         
         # Calculate the prefix index within this sample
         prefix_idx = idx - (self.cumulative_lengths[line_idx - 1] if line_idx > 0 else 0)
         
-        # Load the original sample
-        with open(self.json_path, encoding="utf-8") as f:
+        # Load the original sample - use binary mode for faster I/O
+        with open(self.json_path, 'rb') as f:
             f.seek(self.offsets[line_idx])
-            line = f.readline()
+            line = f.readline().decode('utf-8')
             sample = json.loads(line.strip())
         
         # Parse input text to get context and misspelled word
@@ -170,7 +187,7 @@ class CharGenLazyDataset(Dataset):
             prefix = target
             next_char = "<eow>"
         
-        # Process as before
+        # Process as before - use optimized functions
         context = pad_context(context, self.ctx_len)
         context_vec = vectorize_context(context, self.w2v_model, self.ctx_len)
         misspelled_oh = one_hot_chars(misspelled, self.char_to_id, self.max_word_len)
@@ -227,20 +244,103 @@ class ResNetFFN(nn.Module):
 def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocorrect.pt"):
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
+    scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+    
+    # Track metrics for early stopping and learning rate scheduling
+    best_loss = float('inf')
+    patience_counter = 0
+    max_patience = 3
+    
+    # Learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=1, verbose=True
+    )
+    
     for epoch in range(epochs):
         epoch_loss = 0.0
-        loop = tqdm(dataloader, desc=f"Epoch {epoch+1}", unit="batch")
+        batch_count = 0
+        start_time = time.time()
+        
+        loop = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}", unit="batch")
+        
         for context_vec, misspelled_oh, prefix_oh, next_id in loop:
-            context_vec = context_vec.to(device)
-            misspelled_oh = misspelled_oh.to(device)
-            prefix_oh = prefix_oh.to(device)
-            next_id = next_id.to(device)
-            logits = model(context_vec, misspelled_oh, prefix_oh)
-            loss = F.cross_entropy(logits, next_id)
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Gradient clipping
-            optimizer.step()
+            # Move data to device
+            context_vec = context_vec.to(device, non_blocking=True)
+            misspelled_oh = misspelled_oh.to(device, non_blocking=True)
+            prefix_oh = prefix_oh.to(device, non_blocking=True)
+            next_id = next_id.to(device, non_blocking=True)
+            
+            # Mixed precision training if available
+            if scaler is not None:
+                with torch.cuda.amp.autocast():
+                    logits = model(context_vec, misspelled_oh, prefix_oh)
+                    loss = F.cross_entropy(logits, next_id)
+                
+                optimizer.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Standard training
+                logits = model(context_vec, misspelled_oh, prefix_oh)
+                loss = F.cross_entropy(logits, next_id)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+            
+            # Update metrics
+            batch_loss = loss.item()
+            epoch_loss += batch_loss
+            batch_count += 1
+            
+            # Update progress bar with more info
+            loop.set_postfix(
+                loss=f"{batch_loss:.4f}", 
+                avg=f"{epoch_loss/batch_count:.4f}",
+                lr=f"{optimizer.param_groups[0]['lr']:.6f}",
+                time=f"{(time.time()-start_time)/60:.1f}m"
+            )
+        
+        # End of epoch
+        avg_loss = epoch_loss / batch_count
+        epoch_time = time.time() - start_time
+        print(f"Epoch {epoch+1}/{epochs}: Avg Loss = {avg_loss:.4f}, Time: {epoch_time/60:.1f} minutes")
+        
+        # Update learning rate based on validation loss
+        scheduler.step(avg_loss)
+        
+        # Save model at end of each epoch
+        torch.save({
+            'epoch': epoch,
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'loss': avg_loss,
+        }, save_path)
+        
+        # Early stopping check
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            patience_counter = 0
+            # Save best model
+            torch.save({
+                'epoch': epoch,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'loss': avg_loss,
+            }, f"{save_path}.best")
+            print(f"📈 New best model saved! Loss: {best_loss:.4f}")
+        else:
+            patience_counter += 1
+            if patience_counter >= max_patience:
+                print(f"⚠️ Early stopping after {patience_counter} epochs without improvement")
+                break
+        
+        # Force garbage collection between epochs
+        torch.cuda.empty_cache()
             epoch_loss += loss.item()
             loop.set_postfix(loss=loss.item())
         print(f"Epoch {epoch+1}: Avg Loss = {epoch_loss / len(dataloader):.4f}")
@@ -335,10 +435,10 @@ if __name__ == "__main__":
     parser.add_argument("--max_word_len", type=int, default=50)
     parser.add_argument("--max_gen_len", type=int, default=50)
     parser.add_argument("--ctx_len", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=512)  # Increased default batch size
     parser.add_argument("--model", type=str, default="char_autocorrect.pt")
     parser.add_argument("--chunk_size", type=int, default=1000000, help="Number of samples to process in each chunk")
-    parser.add_argument("--num_workers", type=int, default=2, help="Number of worker processes for data loading")
+    parser.add_argument("--num_workers", type=int, default=8, help="Number of worker processes for data loading")
     args = parser.parse_args()
 
     from gensim.models import KeyedVectors
@@ -397,11 +497,13 @@ if __name__ == "__main__":
             shuffle=True
         )
         
+        # Use more workers to keep CPU busy and GPU fed
         dataloader = DataLoader(
             dataset, 
             batch_sampler=batch_sampler,
             num_workers=args.num_workers,
-            pin_memory=True
+            pin_memory=True,
+            prefetch_factor=2  # Prefetch 2 batches per worker
         )
         
         train_model(model, dataloader, vocab_size=char_vocab_size, epochs=args.epochs, save_path=args.model)   
