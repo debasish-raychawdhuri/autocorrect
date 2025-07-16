@@ -10,6 +10,7 @@ from tqdm import tqdm
 import string
 import os
 import time
+from batch_sampler import BatchSamplerByChunks
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"✅ Using device: {device}")
@@ -336,6 +337,8 @@ if __name__ == "__main__":
     parser.add_argument("--ctx_len", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--model", type=str, default="char_autocorrect.pt")
+    parser.add_argument("--chunk_size", type=int, default=1000000, help="Number of samples to process in each chunk")
+    parser.add_argument("--num_workers", type=int, default=2, help="Number of worker processes for data loading")
     args = parser.parse_args()
 
     from gensim.models import KeyedVectors
@@ -385,7 +388,22 @@ if __name__ == "__main__":
         # Now proceed to dataset and training as before
         dataset = CharGenLazyDataset(args.data, w2v_model, char_to_id,
                                 ctx_len=args.ctx_len, max_word_len=args.max_word_len, max_gen_len=args.max_gen_len)
-        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
+        
+        # Use custom batch sampler to process data in chunks
+        batch_sampler = BatchSamplerByChunks(
+            dataset_size=len(dataset),
+            batch_size=args.batch_size,
+            chunk_size=args.chunk_size,
+            shuffle=True
+        )
+        
+        dataloader = DataLoader(
+            dataset, 
+            batch_sampler=batch_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True
+        )
+        
         train_model(model, dataloader, vocab_size=char_vocab_size, epochs=args.epochs, save_path=args.model)   
     elif args.predict:
         model.load_state_dict(torch.load(args.model, map_location=device))
