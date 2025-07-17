@@ -3,7 +3,7 @@ import nltk
 from nltk.tokenize import sent_tokenize
 
 # -------- CONFIG --------
-BOOKS_DIR = "./gutenberg_books"
+BOOKS_DIR = "./wikipedia"
 OUTPUT_FILE = "./sentences.txt"
 MIN_LEN = 20     # minimum sentence length (characters)
 MAX_LEN = 300    # maximum sentence length (characters)
