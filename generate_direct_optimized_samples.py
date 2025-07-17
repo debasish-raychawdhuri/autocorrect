@@ -58,7 +58,7 @@ def random_corrupt(word):
         return word
 
 def generate_error_samples_from_sentence(sentence):
-    """Generate all valid prefixes for a sentence and create error samples"""
+    """Generate samples with random context lengths for a sentence"""
     tokens = smart_tokenize(sentence)
     
     # Skip sentences that are too short or too long
@@ -66,47 +66,57 @@ def generate_error_samples_from_sentence(sentence):
         return []
     
     samples = []
+    max_target_pos = min(len(tokens), 11)  # position after context
     
-    # Generate samples for context window of size 10
-    for i in range(MIN_LEN-1, min(len(tokens), 11)):  # up to 10 tokens for context
-        prefix_tokens = tokens[max(0, i-10):i]  # take last 10 tokens as context
+    for i in range(MIN_LEN-1, max_target_pos):
         target_word = tokens[i]
         
         # Skip very short target words
         if len(target_word) < 2:
             continue
         
-        # Generate error samples for this prefix
-        used = set()
-        error_samples = []
+        # Choose 2 random context lengths for this target
+        possible_lengths = list(range(min(i+1, 11)))  # +1 because we want to include full length
+        if len(possible_lengths) > 2:
+            context_lengths = random.sample(possible_lengths, 2)
+        else:
+            context_lengths = possible_lengths  # use all if less than 2 available
         
-        # Try to generate exactly ERRORS_PER_SAMPLE versions
-        attempts = 0
-        max_attempts = 20  # Limit attempts to avoid infinite loops
-        
-        while len(error_samples) < ERRORS_PER_SAMPLE and attempts < max_attempts:
-            corrupted = random_corrupt(target_word)
-            attempts += 1
+        # Generate samples for each chosen context length
+        for ctx_len in context_lengths:
+            prefix_tokens = tokens[max(0, i-ctx_len):i]  # take last ctx_len tokens as context
             
-            # Avoid duplicates
-            if corrupted not in used:
-                used.add(corrupted)
+            # Generate error samples for this context
+            used = set()
+            error_samples = []
+            
+            # Try to generate exactly ERRORS_PER_SAMPLE versions
+            attempts = 0
+            max_attempts = 20  # Limit attempts to avoid infinite loops
+            
+            while len(error_samples) < ERRORS_PER_SAMPLE and attempts < max_attempts:
+                corrupted = random_corrupt(target_word)
+                attempts += 1
+                
+                # Avoid duplicates
+                if corrupted not in used:
+                    used.add(corrupted)
+                    error_samples.append({
+                        "context": prefix_tokens,
+                        "misspelled": corrupted,
+                        "target": target_word
+                    })
+            
+            # If we couldn't generate enough unique versions, fill with additional samples
+            while len(error_samples) < ERRORS_PER_SAMPLE:
+                corrupted = random_corrupt(target_word)
                 error_samples.append({
                     "context": prefix_tokens,
                     "misspelled": corrupted,
                     "target": target_word
                 })
-        
-        # If we couldn't generate enough unique versions, fill with additional samples
-        while len(error_samples) < ERRORS_PER_SAMPLE:
-            corrupted = random_corrupt(target_word)
-            error_samples.append({
-                "context": prefix_tokens,
-                "misspelled": corrupted,
-                "target": target_word
-            })
-        
-        samples.extend(error_samples)
+            
+            samples.extend(error_samples)
     
     return samples
 
@@ -148,14 +158,19 @@ def main():
     except:
         print("Could not get system memory information")
     
-    # Store data in memory-efficient structures
-    contexts = []  # List of context word lists
-    misspelled = []  # List of misspelled words
-    targets = []  # List of target words
+    # Pre-allocate lists with estimated size
+    total_lines = count_lines(INPUT_FILE)
+    estimated_selected = int(total_lines * SELECTION_PROB)
+    # Each selected sentence can generate up to 10 contexts, each with ERRORS_PER_SAMPLE variations
+    estimated_samples = estimated_selected * 10 * ERRORS_PER_SAMPLE
+    
+    print(f"Pre-allocating lists for estimated {estimated_samples:,} samples...")
+    contexts = [None] * estimated_samples  # Pre-allocate with None
+    misspelled = [None] * estimated_samples
+    targets = [None] * estimated_samples
     
     # Process file in chunks to manage memory
     with open(INPUT_FILE, "r", encoding="utf-8") as in_file:
-        # Process in chunks
         chunk = []
         total_samples = 0
         processed_lines = 0
@@ -184,10 +199,17 @@ def main():
                 # Collect results
                 for sample_list in results:
                     for sample in sample_list:
-                        contexts.append(sample["context"])
-                        misspelled.append(sample["misspelled"])
-                        targets.append(sample["target"])
-                        total_samples += 1
+                        if total_samples < estimated_samples:
+                            contexts[total_samples] = sample["context"]
+                            misspelled[total_samples] = sample["misspelled"]
+                            targets[total_samples] = sample["target"]
+                            total_samples += 1
+                        else:
+                            # If we exceeded estimate, extend lists
+                            contexts.append(sample["context"])
+                            misspelled.append(sample["misspelled"])
+                            targets.append(sample["target"])
+                            total_samples += 1
                 
                 # Update progress
                 pbar.update(len(chunk))
