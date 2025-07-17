@@ -130,51 +130,8 @@ class CharGenLazyDataset(Dataset):
     
     def _build_offsets_parallel(self, num_workers):
         """Build offsets using multiple processes"""
-        import concurrent.futures
-        
-        # Get file size
-        file_size = os.path.getsize(self.json_path)
-        chunk_size = file_size // num_workers
-        
-        # Function to process a chunk of the file
-        def process_chunk(start_pos, end_pos):
-            chunk_offsets = []
-            with open(self.json_path, 'rb') as f:
-                f.seek(start_pos)
-                
-                # If not at the beginning of the file, find the next newline
-                if start_pos > 0:
-                    while f.read(1) != b'\n' and f.tell() < end_pos:
-                        pass
-                
-                # Record current position
-                pos = f.tell()
-                
-                # Read lines until end position
-                while pos < end_pos:
-                    chunk_offsets.append(pos)
-                    line = f.readline()
-                    pos = f.tell()
-                    
-                    # If we've reached EOF, break
-                    if not line:
-                        break
-            
-            return chunk_offsets
-        
-        # Create chunks
-        chunks = [(i * chunk_size, min((i + 1) * chunk_size, file_size)) 
-                  for i in range(num_workers)]
-        
-        # Process chunks in parallel
-        all_offsets = []
-        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = [executor.submit(process_chunk, start, end) for start, end in chunks]
-            for future in concurrent.futures.as_completed(futures):
-                all_offsets.extend(future.result())
-        
-        # Sort offsets (they might be out of order due to parallel processing)
-        return sorted(all_offsets)
+        # Fall back to sequential processing for now to avoid pickling issues
+        return self._build_offsets_sequential()
 
     def __len__(self):
         return len(self.offsets)
