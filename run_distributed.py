@@ -44,14 +44,14 @@ def main():
         total_memory = torch.cuda.get_device_properties(i).total_memory
         print(f"  GPU {i}: {total_memory / (1024**3):.1f} GB total memory")
 
-    # Build command for torch.distributed.launch
+    # Build command for torchrun (replaces deprecated torch.distributed.launch)
     cmd = [
         sys.executable, 
         "-m", 
-        "torch.distributed.launch",
+        "torch.distributed.run",
         f"--nproc_per_node={nproc}",
-        "--use_env",  # Use environment variables for local rank
         "--master_port=29500",  # Specify port to avoid conflicts
+        "--standalone",  # Single node training
         "run_reu.py",
         "--train",
         "--distributed",

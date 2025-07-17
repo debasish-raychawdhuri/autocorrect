@@ -496,25 +496,40 @@ if __name__ == "__main__":
                 if 'MASTER_ADDR' in os.environ and 'MASTER_PORT' in os.environ:
                     # Using env:// initialization method which uses these environment variables
                     print(f"Initializing process group with local_rank={local_rank}")
-                    dist.init_process_group(backend='nccl', init_method='env://', timeout=timedelta(seconds=300))
+                    dist.init_process_group(
+                        backend='nccl', 
+                        init_method='env://', 
+                        timeout=timedelta(seconds=300),
+                        device_id=local_rank  # Specify device ID to avoid warnings
+                    )
                 else:
                     # Fallback to default initialization
                     print(f"Initializing process group with default settings, local_rank={local_rank}")
-                    dist.init_process_group(backend='nccl', timeout=timedelta(seconds=300))
+                    dist.init_process_group(
+                        backend='nccl', 
+                        timeout=timedelta(seconds=300),
+                        device_id=local_rank  # Specify device ID to avoid warnings
+                    )
                 
-                # Set memory fraction to avoid OOM
-                torch.cuda.set_per_process_memory_fraction(0.8, device=local_rank)
+                # Set memory fraction to avoid OOM (do this early)
+                torch.cuda.set_per_process_memory_fraction(0.7, device=local_rank)
                 
                 print(f"Process {local_rank} using device: {device}")
                 
-                # Test CUDA operations
+                # Test CUDA operations with small tensor
                 test_tensor = torch.randn(10, 10).to(device)
                 _ = test_tensor.sum()
                 torch.cuda.synchronize()
                 print(f"CUDA operations test passed on rank {local_rank}")
                 
+                # Clear test tensor
+                del test_tensor
+                torch.cuda.empty_cache()
+                
             except Exception as e:
                 print(f"Error initializing distributed training on rank {local_rank}: {e}")
+                import traceback
+                traceback.print_exc()
                 # Clean up and exit
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -554,30 +569,43 @@ if __name__ == "__main__":
             # Ensure model is on the correct device before wrapping
             model = model.to(device)
             
+            # Create a simple test to verify the model works on this device
+            print(f"Testing model on device {device} before DDP wrapping...")
+            test_context = torch.randn(1, context_dim).to(device)
+            test_word = torch.randn(1, word_onehot_dim).to(device)
+            test_gen = torch.randn(1, gen_onehot_dim).to(device)
+            
+            with torch.no_grad():
+                _ = model(test_context, test_word, test_gen)
+            torch.cuda.synchronize()
+            print(f"Model test passed on rank {local_rank}")
+            
             # Synchronize before wrapping with DDP
             torch.cuda.synchronize()
             dist.barrier()
             
-            # Wrap with DDP with better error handling
+            # Wrap with DDP with safer settings
             model = DDP(
                 model, 
                 device_ids=[local_rank], 
                 output_device=local_rank,
-                find_unused_parameters=False,  # Set to False for better performance
-                broadcast_buffers=True,
-                gradient_as_bucket_view=True   # More efficient gradient handling
+                find_unused_parameters=False,
+                broadcast_buffers=False,  # Disable to avoid sync issues
+                gradient_as_bucket_view=True,
+                static_graph=True  # Enable static graph optimization
             )
             print(f"Model wrapped with DistributedDataParallel for GPU {local_rank}")
             
-            # Test forward pass
-            test_input = torch.randn(1, model.module.input_proj.in_features).to(device)
-            with torch.no_grad():
-                _ = model.module.input_proj(test_input)
+            # Synchronize after DDP initialization
             torch.cuda.synchronize()
-            print(f"DDP model test passed on rank {local_rank}")
+            dist.barrier()
+            print(f"DDP initialization completed on rank {local_rank}")
             
         except Exception as e:
             print(f"Error wrapping model with DDP on rank {local_rank}: {e}")
+            print(f"Error type: {type(e).__name__}")
+            import traceback
+            traceback.print_exc()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             exit(1)
