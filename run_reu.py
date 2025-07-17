@@ -500,7 +500,7 @@ if __name__ == "__main__":
                         backend='nccl', 
                         init_method='env://', 
                         timeout=timedelta(seconds=300),
-                        device_id=local_rank  # Specify device ID to avoid warnings
+                        device_id=device  # Pass device object, not integer
                     )
                 else:
                     # Fallback to default initialization
@@ -508,7 +508,7 @@ if __name__ == "__main__":
                     dist.init_process_group(
                         backend='nccl', 
                         timeout=timedelta(seconds=300),
-                        device_id=local_rank  # Specify device ID to avoid warnings
+                        device_id=device  # Pass device object, not integer
                     )
                 
                 # Set memory fraction to avoid OOM (do this early)
