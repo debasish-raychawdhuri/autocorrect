@@ -1,0 +1,23 @@
+[package]
+name = "sample_generator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rayon = "1.8"           # For parallel processing
+rand = "0.8"            # For random number generation
+regex = "1.10"          # For text processing
+clap = { version = "4.4", features = ["derive"] } # For command line argument parsing
+indicatif = "0.17"      # For progress bars
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"      # For JSON serialization
+memmap2 = "0.9"         # For memory-mapped file I/O
+parking_lot = "0.12"    # For fast synchronization primitives
+crossbeam = "0.8"       # For concurrent data structures
+
+[profile.release]
+lto = true              # Enable link-time optimization
+codegen-units = 1       # Optimize for size and speed
+panic = "abort"         # Remove panic unwinding overhead
+opt-level = 3           # Maximum optimization
+debug = false           # No debug symbols
