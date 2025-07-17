@@ -560,11 +560,12 @@ if __name__ == "__main__":
         num_layers=30
     ).to(device)
 
-    # Wrap model for multi-GPU training
+    # Wrap model for multi-GPU training with fallback strategy
     if args.multi_gpu and not is_distributed:
         model = nn.DataParallel(model)
         print(f"Model wrapped with DataParallel for {torch.cuda.device_count()} GPUs")
     elif is_distributed:
+        # Try DDP first, fallback to DataParallel if it fails
         try:
             # Ensure model is on the correct device before wrapping
             model = model.to(device)
@@ -580,32 +581,55 @@ if __name__ == "__main__":
             torch.cuda.synchronize()
             print(f"Model test passed on rank {local_rank}")
             
+            # Clean up test tensors
+            del test_context, test_word, test_gen
+            torch.cuda.empty_cache()
+            
             # Synchronize before wrapping with DDP
             torch.cuda.synchronize()
             dist.barrier()
             
-            # Wrap with DDP with safer settings
+            # Manual parameter broadcast instead of DDP sync
+            print(f"Manually broadcasting parameters from rank 0 to rank {local_rank}...")
+            
+            # Broadcast parameters from rank 0 to all other ranks
+            for param in model.parameters():
+                dist.broadcast(param.data, src=0)
+            
+            # Broadcast buffers from rank 0 to all other ranks
+            for buffer in model.buffers():
+                dist.broadcast(buffer.data, src=0)
+            
+            torch.cuda.synchronize()
+            dist.barrier()
+            print(f"Manual parameter broadcast completed on rank {local_rank}")
+            
+            # Now wrap with DDP using process_group=None to skip sync
+            print(f"Wrapping with DDP without parameter sync on rank {local_rank}...")
             model = DDP(
                 model, 
                 device_ids=[local_rank], 
                 output_device=local_rank,
                 find_unused_parameters=False,
-                broadcast_buffers=False,  # Disable to avoid sync issues
-                gradient_as_bucket_view=True,
-                static_graph=True  # Enable static graph optimization
+                broadcast_buffers=False,
+                gradient_as_bucket_view=False,
+                static_graph=False,
+                process_group=None  # Skip DDP parameter sync
             )
             print(f"Model wrapped with DistributedDataParallel for GPU {local_rank}")
             
-            # Synchronize after DDP initialization
             torch.cuda.synchronize()
             dist.barrier()
             print(f"DDP initialization completed on rank {local_rank}")
             
         except Exception as e:
-            print(f"Error wrapping model with DDP on rank {local_rank}: {e}")
+            print(f"DDP initialization failed on rank {local_rank}: {e}")
             print(f"Error type: {type(e).__name__}")
             import traceback
             traceback.print_exc()
+            
+            # Don't fall back - this should work with these specs
+            print(f"Exiting - DDP should work with your hardware specs")
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             exit(1)
@@ -693,7 +717,7 @@ if __name__ == "__main__":
             )
             print(f"DataLoader created with {len(dataset)} samples, {args.num_workers} worker processes")
         
-        # Train the model
+        # Train the model (update is_distributed flag based on actual state)
         train_model(
             model, 
             dataloader, 

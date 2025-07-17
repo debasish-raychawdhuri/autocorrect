@@ -72,15 +72,17 @@ def main():
     env["CUDA_LAUNCH_BLOCKING"] = "1"          # Synchronous CUDA kernel launches
     env["TORCH_USE_CUDA_DSA"] = "1"            # Enable device-side assertions
     env["PYTHONFAULTHANDLER"] = "1"           # Enable Python fault handler
-    env["NCCL_ASYNC_ERROR_HANDLING"] = "1"     # Better NCCL error handling
+    env["NCCL_ASYNC_ERROR_HANDLING"] = "0"     # Disable async error handling
+    env["NCCL_BLOCKING_WAIT"] = "0"            # Disable blocking waits
+    env["NCCL_TIMEOUT"] = "600"                # Increase timeout
     
     if args.debug:
         env["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"  # Enable detailed distributed debugging
         env["NCCL_DEBUG"] = "INFO"                # Enable NCCL debugging
         env["NCCL_DEBUG_SUBSYS"] = "ALL"          # Debug all NCCL subsystems
     
-    # Memory management
-    env["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"  # Limit memory fragmentation
+    # Memory management - more conservative for large system
+    env["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:1024"  # Allow larger allocations
     
     # Run the process with output streaming to console
     process = subprocess.Popen(
