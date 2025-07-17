@@ -67,9 +67,9 @@ def generate_error_samples_from_sentence(sentence):
     
     samples = []
     
-    # Generate samples for each prefix length
-    for i in range(MIN_LEN-1, len(tokens)):
-        prefix_tokens = tokens[:i]
+    # Generate samples for context window of size 10
+    for i in range(MIN_LEN-1, min(len(tokens), 11)):  # up to 10 tokens for context
+        prefix_tokens = tokens[max(0, i-10):i]  # take last 10 tokens as context
         target_word = tokens[i]
         
         # Skip very short target words
