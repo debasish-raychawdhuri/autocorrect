@@ -1,5 +1,6 @@
 import re
 import os
+import random
 from datasets import load_dataset, get_dataset_config_info
 from tqdm.auto import tqdm
 
@@ -103,6 +104,8 @@ def download_and_clean_wikipedia(target_gb=5, output_filename="clean_wikipedia_d
                 page_text = example['text']
 
                 cleaned_text = clean_wikipedia_text(page_text)
+                if random.randint(0, 100) < 10:
+                    continue
 
                 if len(cleaned_text) < 100:
                     continue
@@ -128,4 +131,4 @@ def download_and_clean_wikipedia(target_gb=5, output_filename="clean_wikipedia_d
 
 
 if __name__ == "__main__":
-    download_and_clean_wikipedia(target_gb=5, output_filename="clean_wikipedia_for_autocorrect.txt")
+    download_and_clean_wikipedia(target_gb=1, output_filename="clean_wikipedia_for_autocorrect.txt")
