@@ -97,7 +97,7 @@ def vectorize_context(context_words, w2v_model, ctx_len=10, embed_dim=300):
 # ---- Lazy Dataset ----
 
 class CharGenLazyDataset(Dataset):
-    def __init__(self, json_path, w2v_model, char_to_id, ctx_len=10, max_word_len=50, max_gen_len=50):
+    def __init__(self, json_path, w2v_model, char_to_id, ctx_len=10, max_word_len=50, max_gen_len=50, num_workers=4):
         self.json_path = json_path
         self.w2v_model = w2v_model
         self.char_to_id = char_to_id
@@ -105,13 +105,75 @@ class CharGenLazyDataset(Dataset):
         self.max_word_len = max_word_len
         self.max_gen_len = max_gen_len
 
-        # Build byte offsets for all lines
-        self.offsets = []
-        with open(json_path, encoding="utf-8") as f:
+        # Build byte offsets for all lines using multiple processes
+        print(f"Building dataset index with {num_workers} workers...")
+        start_time = time.time()
+        
+        if num_workers > 1:
+            self.offsets = self._build_offsets_parallel(num_workers)
+        else:
+            self.offsets = self._build_offsets_sequential()
+            
+        end_time = time.time()
+        print(f"Dataset index built with {len(self.offsets)} samples in {end_time - start_time:.2f} seconds")
+
+    def _build_offsets_sequential(self):
+        """Build offsets sequentially"""
+        offsets = []
+        with open(self.json_path, encoding="utf-8") as f:
             pos = 0
             for line in f:
-                self.offsets.append(pos)
+                offsets.append(pos)
                 pos += len(line.encode("utf-8"))
+        return offsets
+    
+    def _build_offsets_parallel(self, num_workers):
+        """Build offsets using multiple processes"""
+        import concurrent.futures
+        
+        # Get file size
+        file_size = os.path.getsize(self.json_path)
+        chunk_size = file_size // num_workers
+        
+        # Function to process a chunk of the file
+        def process_chunk(start_pos, end_pos):
+            chunk_offsets = []
+            with open(self.json_path, 'rb') as f:
+                f.seek(start_pos)
+                
+                # If not at the beginning of the file, find the next newline
+                if start_pos > 0:
+                    while f.read(1) != b'\n' and f.tell() < end_pos:
+                        pass
+                
+                # Record current position
+                pos = f.tell()
+                
+                # Read lines until end position
+                while pos < end_pos:
+                    chunk_offsets.append(pos)
+                    line = f.readline()
+                    pos = f.tell()
+                    
+                    # If we've reached EOF, break
+                    if not line:
+                        break
+            
+            return chunk_offsets
+        
+        # Create chunks
+        chunks = [(i * chunk_size, min((i + 1) * chunk_size, file_size)) 
+                  for i in range(num_workers)]
+        
+        # Process chunks in parallel
+        all_offsets = []
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = [executor.submit(process_chunk, start, end) for start, end in chunks]
+            for future in concurrent.futures.as_completed(futures):
+                all_offsets.extend(future.result())
+        
+        # Sort offsets (they might be out of order due to parallel processing)
+        return sorted(all_offsets)
 
     def __len__(self):
         return len(self.offsets)
@@ -172,12 +234,15 @@ class ResNetFFN(nn.Module):
 # ---- Training & Prediction ----
 
 def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocorrect.pt", 
-              local_rank=0, is_distributed=False):
+              local_rank=0, is_distributed=False, num_workers=4):
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
     
     # Track best model (only save on rank 0 if distributed)
     best_loss = float('inf')
+    
+    # Set up data prefetcher for faster data loading
+    from torch.utils.data import DataLoader, Dataset
     
     for epoch in range(epochs):
         epoch_loss = 0.0
@@ -194,10 +259,10 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
             loop = dataloader
             
         for context_vec, misspelled_oh, prefix_oh, next_id in loop:
-            context_vec = context_vec.to(device)
-            misspelled_oh = misspelled_oh.to(device)
-            prefix_oh = prefix_oh.to(device)
-            next_id = next_id.to(device)
+            context_vec = context_vec.to(device, non_blocking=True)
+            misspelled_oh = misspelled_oh.to(device, non_blocking=True)
+            prefix_oh = prefix_oh.to(device, non_blocking=True)
+            next_id = next_id.to(device, non_blocking=True)
             
             logits = model(context_vec, misspelled_oh, prefix_oh)
             loss = F.cross_entropy(logits, next_id)
@@ -206,6 +271,10 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Gradient clipping
             optimizer.step()
+            
+            # Add explicit CUDA synchronization for multi-GPU stability
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             
             epoch_loss += loss.item()
             batch_count += 1
@@ -315,6 +384,9 @@ def model_matches(model, state_dict):
 # ---- CLI ----
 
 if __name__ == "__main__":
+    # Set multiprocessing start method
+    import multiprocessing as mp
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--predict", action="store_true")
@@ -331,11 +403,32 @@ if __name__ == "__main__":
     parser.add_argument("--distributed", action="store_true", help="Use DistributedDataParallel for multi-GPU training")
     parser.add_argument("--local_rank", "--local-rank", type=int, default=-1, help="Local rank for distributed training")
     parser.add_argument("--gpu", type=int, default=None, help="Specific GPU to use (if not using multi_gpu)")
+    # Add CPU utilization arguments
+    parser.add_argument("--num_workers", type=int, default=None, 
+                        help="Number of worker processes for data loading (default: auto-detect based on CPU count)")
+    parser.add_argument("--mp_start_method", type=str, default='fork', choices=['fork', 'spawn', 'forkserver'],
+                        help="Multiprocessing start method")
     args = parser.parse_args()
 
     # Setup for distributed training if enabled
     is_distributed = args.distributed
     local_rank = args.local_rank
+    
+    # Set multiprocessing start method
+    try:
+        mp.set_start_method(args.mp_start_method)
+        print(f"Using multiprocessing start method: {args.mp_start_method}")
+    except RuntimeError:
+        print(f"Multiprocessing start method already set to: {mp.get_start_method()}")
+    
+    # Determine optimal number of workers for data loading
+    if args.num_workers is None:
+        # Use 80% of available CPUs for data loading
+        cpu_count = mp.cpu_count()
+        args.num_workers = max(1, int(cpu_count * 0.8))
+        print(f"Auto-detected {cpu_count} CPUs, using {args.num_workers} worker processes")
+    else:
+        print(f"Using {args.num_workers} worker processes as specified")
     
     if is_distributed:
         # Check environment variables first
@@ -436,9 +529,17 @@ if __name__ == "__main__":
         else:
             print("No existing model found. Training new model from scratch.")
 
-        # Create dataset
-        dataset = CharGenLazyDataset(args.data, w2v_model, char_to_id,
-                                ctx_len=args.ctx_len, max_word_len=args.max_word_len, max_gen_len=args.max_gen_len)
+        # Create dataset with parallel processing
+        print(f"Creating dataset with {args.num_workers} workers for initialization...")
+        dataset = CharGenLazyDataset(
+            args.data, 
+            w2v_model, 
+            char_to_id,
+            ctx_len=args.ctx_len, 
+            max_word_len=args.max_word_len, 
+            max_gen_len=args.max_gen_len,
+            num_workers=args.num_workers
+        )
         
         # Setup data loading based on distributed mode
         if is_distributed:
@@ -448,20 +549,24 @@ if __name__ == "__main__":
                 dataset, 
                 batch_size=args.batch_size,
                 sampler=sampler,
-                num_workers=4,
-                pin_memory=True
+                num_workers=args.num_workers // max(1, torch.cuda.device_count()),
+                pin_memory=True,
+                persistent_workers=True,
+                prefetch_factor=2
             )
-            print(f"Rank {local_rank}: Distributed DataLoader created with {len(dataset)} samples")
+            print(f"Rank {local_rank}: Distributed DataLoader created with {len(dataset)} samples, {args.num_workers // max(1, torch.cuda.device_count())} workers per process")
         else:
             # Regular DataLoader for single GPU or DataParallel
             dataloader = DataLoader(
                 dataset, 
                 batch_size=args.batch_size, 
                 shuffle=True, 
-                num_workers=4, 
-                pin_memory=True
+                num_workers=args.num_workers,
+                pin_memory=True,
+                persistent_workers=True,
+                prefetch_factor=2
             )
-            print(f"DataLoader created with {len(dataset)} samples")
+            print(f"DataLoader created with {len(dataset)} samples, {args.num_workers} worker processes")
         
         # Train the model
         train_model(
@@ -471,7 +576,8 @@ if __name__ == "__main__":
             epochs=args.epochs, 
             save_path=args.model,
             local_rank=local_rank if is_distributed else 0,
-            is_distributed=is_distributed
+            is_distributed=is_distributed,
+            num_workers=args.num_workers
         )
     elif args.predict:
         # For prediction, we need to unwrap the model if it's wrapped in DataParallel or DDP
