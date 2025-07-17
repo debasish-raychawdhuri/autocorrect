@@ -37,6 +37,12 @@ def main():
     # Use all available GPUs if not specified
     nproc = args.nproc_per_node if args.nproc_per_node is not None else num_gpus
     print(f"Launching distributed training on {nproc} GPUs")
+    
+    # Check GPU memory before launching
+    print("GPU Memory Status:")
+    for i in range(num_gpus):
+        total_memory = torch.cuda.get_device_properties(i).total_memory
+        print(f"  GPU {i}: {total_memory / (1024**3):.1f} GB total memory")
 
     # Build command for torch.distributed.launch
     cmd = [
@@ -45,6 +51,7 @@ def main():
         "torch.distributed.launch",
         f"--nproc_per_node={nproc}",
         "--use_env",  # Use environment variables for local rank
+        "--master_port=29500",  # Specify port to avoid conflicts
         "run_reu.py",
         "--train",
         "--distributed",
@@ -60,10 +67,20 @@ def main():
     
     # Set environment variables to get more detailed error information
     env = os.environ.copy()
+    
+    # Always set these for better debugging
+    env["CUDA_LAUNCH_BLOCKING"] = "1"          # Synchronous CUDA kernel launches
+    env["TORCH_USE_CUDA_DSA"] = "1"            # Enable device-side assertions
+    env["PYTHONFAULTHANDLER"] = "1"           # Enable Python fault handler
+    env["NCCL_ASYNC_ERROR_HANDLING"] = "1"     # Better NCCL error handling
+    
     if args.debug:
         env["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"  # Enable detailed distributed debugging
         env["NCCL_DEBUG"] = "INFO"                # Enable NCCL debugging
-        env["PYTHONFAULTHANDLER"] = "1"           # Enable Python fault handler
+        env["NCCL_DEBUG_SUBSYS"] = "ALL"          # Debug all NCCL subsystems
+    
+    # Memory management
+    env["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"  # Limit memory fragmentation
     
     # Run the process with output streaming to console
     process = subprocess.Popen(

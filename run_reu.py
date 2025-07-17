@@ -13,6 +13,7 @@ from tqdm import tqdm
 import string
 import os
 import time
+from datetime import timedelta
 
 # Set up device
 def setup_device(gpu_id=None, use_multi_gpu=False):
@@ -244,6 +245,16 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
     # Set up data prefetcher for faster data loading
     from torch.utils.data import DataLoader, Dataset
     
+    # Initialize CUDA context and synchronize all processes
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank if is_distributed else 0)
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    
+    # Synchronize all processes before training
+    if is_distributed:
+        dist.barrier()
+    
     for epoch in range(epochs):
         epoch_loss = 0.0
         batch_count = 0
@@ -259,29 +270,51 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
             loop = dataloader
             
         for context_vec, misspelled_oh, prefix_oh, next_id in loop:
-            context_vec = context_vec.to(device, non_blocking=True)
-            misspelled_oh = misspelled_oh.to(device, non_blocking=True)
-            prefix_oh = prefix_oh.to(device, non_blocking=True)
-            next_id = next_id.to(device, non_blocking=True)
-            
-            logits = model(context_vec, misspelled_oh, prefix_oh)
-            loss = F.cross_entropy(logits, next_id)
-            
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Gradient clipping
-            optimizer.step()
-            
-            # Add explicit CUDA synchronization for multi-GPU stability
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            
-            epoch_loss += loss.item()
-            batch_count += 1
-            
-            if not is_distributed or local_rank == 0:
-                if isinstance(loop, tqdm):
-                    loop.set_postfix(loss=loss.item())
+            try:
+                # Ensure tensors are on the correct device with proper synchronization
+                context_vec = context_vec.to(device, non_blocking=True)
+                misspelled_oh = misspelled_oh.to(device, non_blocking=True)
+                prefix_oh = prefix_oh.to(device, non_blocking=True)
+                next_id = next_id.to(device, non_blocking=True)
+                
+                # Wait for data transfer to complete before forward pass
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
+                logits = model(context_vec, misspelled_oh, prefix_oh)
+                loss = F.cross_entropy(logits, next_id)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                
+                # Synchronize gradients before clipping in distributed mode
+                if is_distributed:
+                    torch.cuda.synchronize()
+                
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Gradient clipping
+                optimizer.step()
+                
+                # Add explicit CUDA synchronization for multi-GPU stability
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
+                epoch_loss += loss.item()
+                batch_count += 1
+                
+                if not is_distributed or local_rank == 0:
+                    if isinstance(loop, tqdm):
+                        loop.set_postfix(loss=loss.item())
+                        
+            except RuntimeError as e:
+                if "CUDA" in str(e) or "illegal memory access" in str(e):
+                    print(f"CUDA error on rank {local_rank}: {e}")
+                    # Clear CUDA cache and try to recover
+                    torch.cuda.empty_cache()
+                    if is_distributed:
+                        dist.barrier()
+                    continue
+                else:
+                    raise e
         
         # Calculate average loss
         avg_loss = epoch_loss / batch_count
@@ -302,7 +335,14 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
             
         # Synchronize processes if distributed
         if is_distributed:
+            # Clear CUDA cache before barrier to prevent memory issues
+            torch.cuda.empty_cache()
             dist.barrier()
+            
+        # Additional cleanup between epochs
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
 def predict_word(model, w2v_model, char_to_id, id_to_char, context_words, misspelled_word,
                  max_word_len=30, max_gen_len=50, ctx_len=10, max_output_len=30, beam_width=10):
@@ -439,21 +479,46 @@ if __name__ == "__main__":
             local_rank = env_local_rank
             print(f"Using local_rank={local_rank} from environment variables")
         
-        # Initialize distributed process group
+        # Initialize distributed process group with better error handling
         if local_rank != -1:
-            # Check if we're using PyTorch's distributed launch
-            if 'MASTER_ADDR' in os.environ and 'MASTER_PORT' in os.environ:
-                # Using env:// initialization method which uses these environment variables
-                print(f"Initializing process group with local_rank={local_rank}")
-                dist.init_process_group(backend='nccl', init_method='env://')
-            else:
-                # Fallback to default initialization
-                print(f"Initializing process group with default settings, local_rank={local_rank}")
-                dist.init_process_group(backend='nccl')
+            try:
+                # Clear CUDA cache before initialization
+                torch.cuda.empty_cache()
                 
-            torch.cuda.set_device(local_rank)
-            device = torch.device(f"cuda:{local_rank}")
-            print(f"Process {local_rank} using device: {device}")
+                # Set device before initializing process group
+                torch.cuda.set_device(local_rank)
+                device = torch.device(f"cuda:{local_rank}")
+                
+                # Initialize CUDA context
+                torch.cuda.init()
+                
+                # Check if we're using PyTorch's distributed launch
+                if 'MASTER_ADDR' in os.environ and 'MASTER_PORT' in os.environ:
+                    # Using env:// initialization method which uses these environment variables
+                    print(f"Initializing process group with local_rank={local_rank}")
+                    dist.init_process_group(backend='nccl', init_method='env://', timeout=timedelta(seconds=300))
+                else:
+                    # Fallback to default initialization
+                    print(f"Initializing process group with default settings, local_rank={local_rank}")
+                    dist.init_process_group(backend='nccl', timeout=timedelta(seconds=300))
+                
+                # Set memory fraction to avoid OOM
+                torch.cuda.set_per_process_memory_fraction(0.8, device=local_rank)
+                
+                print(f"Process {local_rank} using device: {device}")
+                
+                # Test CUDA operations
+                test_tensor = torch.randn(10, 10).to(device)
+                _ = test_tensor.sum()
+                torch.cuda.synchronize()
+                print(f"CUDA operations test passed on rank {local_rank}")
+                
+            except Exception as e:
+                print(f"Error initializing distributed training on rank {local_rank}: {e}")
+                # Clean up and exit
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                exit(1)
         else:
             print("Error: --distributed requires --local_rank to be set or environment variables")
             exit(1)
@@ -485,8 +550,37 @@ if __name__ == "__main__":
         model = nn.DataParallel(model)
         print(f"Model wrapped with DataParallel for {torch.cuda.device_count()} GPUs")
     elif is_distributed:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-        print(f"Model wrapped with DistributedDataParallel for GPU {local_rank}")
+        try:
+            # Ensure model is on the correct device before wrapping
+            model = model.to(device)
+            
+            # Synchronize before wrapping with DDP
+            torch.cuda.synchronize()
+            dist.barrier()
+            
+            # Wrap with DDP with better error handling
+            model = DDP(
+                model, 
+                device_ids=[local_rank], 
+                output_device=local_rank,
+                find_unused_parameters=False,  # Set to False for better performance
+                broadcast_buffers=True,
+                gradient_as_bucket_view=True   # More efficient gradient handling
+            )
+            print(f"Model wrapped with DistributedDataParallel for GPU {local_rank}")
+            
+            # Test forward pass
+            test_input = torch.randn(1, model.module.input_proj.in_features).to(device)
+            with torch.no_grad():
+                _ = model.module.input_proj(test_input)
+            torch.cuda.synchronize()
+            print(f"DDP model test passed on rank {local_rank}")
+            
+        except Exception as e:
+            print(f"Error wrapping model with DDP on rank {local_rank}: {e}")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            exit(1)
 
     if args.train:
         from pathlib import Path
@@ -545,14 +639,17 @@ if __name__ == "__main__":
         if is_distributed:
             # Use DistributedSampler for distributed training
             sampler = DistributedSampler(dataset)
+            # Reduce workers per process for distributed training to avoid memory issues
+            workers_per_process = max(1, args.num_workers // max(1, torch.cuda.device_count()))
             dataloader = DataLoader(
                 dataset, 
                 batch_size=args.batch_size,
                 sampler=sampler,
-                num_workers=args.num_workers // max(1, torch.cuda.device_count()),
+                num_workers=workers_per_process,
                 pin_memory=True,
-                persistent_workers=True,
-                prefetch_factor=2
+                persistent_workers=True if workers_per_process > 0 else False,
+                prefetch_factor=2,
+                drop_last=True  # Ensure consistent batch sizes across ranks
             )
             print(f"Rank {local_rank}: Distributed DataLoader created with {len(dataset)} samples, {args.num_workers // max(1, torch.cuda.device_count())} workers per process")
         else:
