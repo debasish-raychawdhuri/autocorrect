@@ -95,11 +95,15 @@ def process_sentences_parallel(in_file, out_file, ctx_len=10, n_noisy=10, num_wo
                             chunks = [sentences_batch[i:i+chunk_size] for i in range(0, len(sentences_batch), chunk_size)]
                             args_list = [(chunk, ctx_len, n_noisy, alphabet) for chunk in chunks]
                             
-                            # Process in parallel and write immediately
+                            # Process in parallel and buffer results
+                            batch_output = []
                             with multiprocessing.Pool(processes=num_workers) as pool:
                                 for batch_results in pool.imap_unordered(worker, args_list):
-                                    for sample in batch_results:
-                                        fout.write(json.dumps(sample) + "\n")
+                                    batch_output.extend(batch_results)
+                            
+                            # Write all results at once
+                            for sample in batch_output:
+                                fout.write(json.dumps(sample) + "\n")
                             
                             processed_sentences += len(sentences_batch)
                             pbar.update(len(sentences_batch))
@@ -111,10 +115,15 @@ def process_sentences_parallel(in_file, out_file, ctx_len=10, n_noisy=10, num_wo
                     chunks = [sentences_batch[i:i+chunk_size] for i in range(0, len(sentences_batch), chunk_size)]
                     args_list = [(chunk, ctx_len, n_noisy, alphabet) for chunk in chunks]
                     
+                    # Process remaining sentences and buffer results
+                    batch_output = []
                     with multiprocessing.Pool(processes=num_workers) as pool:
                         for batch_results in pool.imap_unordered(worker, args_list):
-                            for sample in batch_results:
-                                fout.write(json.dumps(sample) + "\n")
+                            batch_output.extend(batch_results)
+                    
+                    # Write all results at once
+                    for sample in batch_output:
+                        fout.write(json.dumps(sample) + "\n")
                     
                     processed_sentences += len(sentences_batch)
                     pbar.update(len(sentences_batch))
