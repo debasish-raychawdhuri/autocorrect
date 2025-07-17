@@ -37,6 +37,22 @@ def setup_device(gpu_id=None, use_multi_gpu=False):
         print(f"✅ Using single GPU: 0")
         return device, 1
 
+# Check for distributed environment variables
+def get_distributed_info():
+    """Get distributed training information from environment variables"""
+    rank = int(os.environ.get('RANK', -1))
+    world_size = int(os.environ.get('WORLD_SIZE', -1))
+    local_rank = int(os.environ.get('LOCAL_RANK', -1))
+    
+    # If any of these are not set, check for SLURM variables
+    if rank == -1 or world_size == -1 or local_rank == -1:
+        if 'SLURM_PROCID' in os.environ:
+            rank = int(os.environ['SLURM_PROCID'])
+            world_size = int(os.environ['SLURM_NTASKS'])
+            local_rank = int(os.environ['SLURM_LOCALID'])
+    
+    return rank, world_size, local_rank
+
 # Default device setup (will be updated in main)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"✅ Initial device setup: {device}")
@@ -313,7 +329,7 @@ if __name__ == "__main__":
     # Add multi-GPU arguments
     parser.add_argument("--multi_gpu", action="store_true", help="Use multiple GPUs with DataParallel")
     parser.add_argument("--distributed", action="store_true", help="Use DistributedDataParallel for multi-GPU training")
-    parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training")
+    parser.add_argument("--local_rank", "--local-rank", type=int, default=-1, help="Local rank for distributed training")
     parser.add_argument("--gpu", type=int, default=None, help="Specific GPU to use (if not using multi_gpu)")
     args = parser.parse_args()
 
@@ -322,13 +338,31 @@ if __name__ == "__main__":
     local_rank = args.local_rank
     
     if is_distributed:
+        # Check environment variables first
+        env_rank, env_world_size, env_local_rank = get_distributed_info()
+        
+        # Use environment variables if available, otherwise use command line args
+        if env_local_rank != -1:
+            local_rank = env_local_rank
+            print(f"Using local_rank={local_rank} from environment variables")
+        
         # Initialize distributed process group
         if local_rank != -1:
-            dist.init_process_group(backend='nccl')
+            # Check if we're using PyTorch's distributed launch
+            if 'MASTER_ADDR' in os.environ and 'MASTER_PORT' in os.environ:
+                # Using env:// initialization method which uses these environment variables
+                print(f"Initializing process group with local_rank={local_rank}")
+                dist.init_process_group(backend='nccl', init_method='env://')
+            else:
+                # Fallback to default initialization
+                print(f"Initializing process group with default settings, local_rank={local_rank}")
+                dist.init_process_group(backend='nccl')
+                
             torch.cuda.set_device(local_rank)
             device = torch.device(f"cuda:{local_rank}")
+            print(f"Process {local_rank} using device: {device}")
         else:
-            print("Error: --distributed requires --local_rank to be set")
+            print("Error: --distributed requires --local_rank to be set or environment variables")
             exit(1)
     else:
         # Setup device based on arguments

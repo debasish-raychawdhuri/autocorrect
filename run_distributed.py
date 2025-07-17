@@ -23,6 +23,8 @@ def main():
                         help="Batch size per GPU")
     parser.add_argument("--model", type=str, default="char_autocorrect.pt",
                         help="Path to save model")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable debug mode with more verbose output")
     args = parser.parse_args()
 
     # Get number of available GPUs
@@ -38,8 +40,11 @@ def main():
 
     # Build command for torch.distributed.launch
     cmd = [
-        sys.executable, "-m", "torch.distributed.launch",
+        sys.executable, 
+        "-m", 
+        "torch.distributed.launch",
         f"--nproc_per_node={nproc}",
+        "--use_env",  # Use environment variables for local rank
         "run_reu.py",
         "--train",
         "--distributed",
@@ -50,14 +55,36 @@ def main():
         f"--model={args.model}"
     ]
 
-    # Launch the distributed training
+    # Launch the distributed training with full error output
     print(f"Running command: {' '.join(cmd)}")
-    process = subprocess.Popen(cmd)
-    process.wait()
     
-    if process.returncode != 0:
-        print(f"Training failed with return code {process.returncode}")
-        sys.exit(process.returncode)
+    # Set environment variables to get more detailed error information
+    env = os.environ.copy()
+    if args.debug:
+        env["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"  # Enable detailed distributed debugging
+        env["NCCL_DEBUG"] = "INFO"                # Enable NCCL debugging
+        env["PYTHONFAULTHANDLER"] = "1"           # Enable Python fault handler
+    
+    # Run the process with output streaming to console
+    process = subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True,
+        bufsize=1
+    )
+    
+    # Stream output in real-time
+    for line in iter(process.stdout.readline, ''):
+        print(line, end='')
+    
+    process.stdout.close()
+    return_code = process.wait()
+    
+    if return_code != 0:
+        print(f"Training failed with return code {return_code}")
+        sys.exit(return_code)
     
     print("Distributed training completed successfully!")
 
