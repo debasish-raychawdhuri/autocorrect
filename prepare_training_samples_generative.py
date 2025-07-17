@@ -68,25 +68,56 @@ def worker(args):
         batch.extend(generate_samples_for_sentence(sentence, ctx_len, n_noisy, alphabet))
     return batch
 
-def process_sentences_parallel(in_file, out_file, ctx_len=10, n_noisy=10, num_workers=None):
+def process_sentences_parallel(in_file, out_file, ctx_len=10, n_noisy=10, num_workers=None, batch_size=1000):
+    # Count total sentences for progress tracking
     with open(in_file, encoding="utf-8") as fin:
-        sentences = [line.strip() for line in fin if line.strip()]
-    total = len(sentences)
+        total_sentences = sum(1 for line in fin if line.strip())
+    
     num_workers = num_workers or multiprocessing.cpu_count()
-    chunk_size = math.ceil(total / num_workers)
-    chunks = [sentences[i:i+chunk_size] for i in range(0, total, chunk_size)]
     alphabet = "abcdefghijklmnopqrstuvwxyz'"
-
-    args_list = [(chunk, ctx_len, n_noisy, alphabet) for chunk in chunks]
-
-    results = []
-    with multiprocessing.Pool(processes=num_workers) as pool:
-        for batch in tqdm(pool.imap_unordered(worker, args_list), total=len(chunks), desc="Processing"):
-            results.extend(batch)
-
+    
+    # Open output file for writing
     with open(out_file, "w", encoding="utf-8") as fout:
-        for sample in tqdm(results, desc="Writing"):
-            fout.write(json.dumps(sample) + "\n")
+        with open(in_file, encoding="utf-8") as fin:
+            sentences_batch = []
+            processed_sentences = 0
+            
+            with tqdm(total=total_sentences, desc="Processing sentences") as pbar:
+                for line in fin:
+                    sentence = line.strip()
+                    if sentence:
+                        sentences_batch.append(sentence)
+                        
+                        # Process batch when it reaches batch_size
+                        if len(sentences_batch) >= batch_size:
+                            # Create chunks for multiprocessing
+                            chunk_size = math.ceil(len(sentences_batch) / num_workers)
+                            chunks = [sentences_batch[i:i+chunk_size] for i in range(0, len(sentences_batch), chunk_size)]
+                            args_list = [(chunk, ctx_len, n_noisy, alphabet) for chunk in chunks]
+                            
+                            # Process in parallel and write immediately
+                            with multiprocessing.Pool(processes=num_workers) as pool:
+                                for batch_results in pool.imap_unordered(worker, args_list):
+                                    for sample in batch_results:
+                                        fout.write(json.dumps(sample) + "\n")
+                            
+                            processed_sentences += len(sentences_batch)
+                            pbar.update(len(sentences_batch))
+                            sentences_batch = []  # Clear batch from memory
+                
+                # Process remaining sentences
+                if sentences_batch:
+                    chunk_size = math.ceil(len(sentences_batch) / num_workers)
+                    chunks = [sentences_batch[i:i+chunk_size] for i in range(0, len(sentences_batch), chunk_size)]
+                    args_list = [(chunk, ctx_len, n_noisy, alphabet) for chunk in chunks]
+                    
+                    with multiprocessing.Pool(processes=num_workers) as pool:
+                        for batch_results in pool.imap_unordered(worker, args_list):
+                            for sample in batch_results:
+                                fout.write(json.dumps(sample) + "\n")
+                    
+                    processed_sentences += len(sentences_batch)
+                    pbar.update(len(sentences_batch))
 
 if __name__ == "__main__":
     import argparse
@@ -96,6 +127,7 @@ if __name__ == "__main__":
     parser.add_argument("--ctx_len", type=int, default=10)
     parser.add_argument("--n_noisy", type=int, default=10)
     parser.add_argument("--workers", type=int, default=None, help="Number of processes (defaults to all cores)")
+    parser.add_argument("--batch_size", type=int, default=1000, help="Number of sentences to process before writing to disk")
     args = parser.parse_args()
-    process_sentences_parallel(args.infile, args.outfile, ctx_len=args.ctx_len, n_noisy=args.n_noisy, num_workers=args.workers)
+    process_sentences_parallel(args.infile, args.outfile, ctx_len=args.ctx_len, n_noisy=args.n_noisy, num_workers=args.workers, batch_size=args.batch_size)
 
