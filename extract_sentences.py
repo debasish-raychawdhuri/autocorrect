@@ -1,5 +1,6 @@
 import os
 import nltk
+from random import random
 from nltk.tokenize import sent_tokenize
 
 # -------- CONFIG --------
@@ -12,7 +13,7 @@ MAX_LEN = 300    # maximum sentence length (characters)
 def extract_sentences_from_text(text):
     sentences = sent_tokenize(text)
     sentences = [s.strip().replace("\n", " ") for s in sentences]
-    return [s for s in sentences if MIN_LEN <= len(s) <= MAX_LEN]
+    return [s for s in sentences if MIN_LEN <= len(s) <= MAX_LEN  and random() < 0.2]
 
 def main():
     all_sentences = []
