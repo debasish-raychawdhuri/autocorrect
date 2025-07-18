@@ -4,7 +4,7 @@ from nltk.tokenize import sent_tokenize
 from tqdm import tqdm
 
 # -------- CONFIG --------
-WIKI_DIR = "./wiki"
+WIKI_DIR = "./wikipedia"
 OUTPUT_FILE = "./wiki_sentences.txt"
 MIN_LEN = 20     # minimum sentence length (characters)
 MAX_LEN = 300    # maximum sentence length (characters)
