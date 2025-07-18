@@ -128,7 +128,7 @@ def create_optimized_dataloader(dataset, batch_size, num_workers):
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=4,  # Increased prefetch
+        prefetch_factor=1,  # Reduced prefetch to prevent RAM overflow
         drop_last=True,
         multiprocessing_context=mp.get_context('spawn')  # Use spawn instead of fork
     )
