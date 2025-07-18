@@ -21,7 +21,8 @@ def convert_word2vec_to_numpy(input_path, output_path):
     
     # Extract vocabulary and vectors
     words = list(model.key_to_index.keys())
-    vectors = np.array([model[word] for word in words], dtype=np.float32)
+    print("Converting vectors to numpy arrays...")
+    vectors = np.array([model[word] for word in tqdm(words, desc="Extracting vectors")], dtype=np.float32)
     
     # Create word-to-index mapping
     word_to_idx = {word: i for i, word in enumerate(words)}
@@ -35,13 +36,17 @@ def convert_word2vec_to_numpy(input_path, output_path):
         'vocab_size': len(words)
     }
     
-    print(f"Saving to {output_path}")
+    print(f"Saving to {output_path} (this may take several minutes for large files...)")
     np.savez_compressed(output_path, **data)
+    print("Saving complete!")
     
     print(f"Conversion complete!")
     print(f"Vocabulary size: {len(words)}")
     print(f"Vector dimension: {model.vector_size}")
-    print(f"Output file size: {np.load(output_path, allow_pickle=True).nbytes / 1024 / 1024:.2f} MB")
+    # Get file size
+    import os
+    file_size_mb = os.path.getsize(output_path) / 1024 / 1024
+    print(f"Output file size: {file_size_mb:.2f} MB")
 
 def convert_word2vec_to_pickle(input_path, output_path):
     """Convert word2vec binary format to pickle format"""
@@ -54,6 +59,7 @@ def convert_word2vec_to_pickle(input_path, output_path):
     
     # Extract vocabulary and vectors
     word_vectors = {}
+    print("Converting vectors to dictionary format...")
     for word in tqdm(model.key_to_index.keys(), desc="Converting vectors"):
         word_vectors[word] = model[word].astype(np.float32)
     
@@ -64,13 +70,19 @@ def convert_word2vec_to_pickle(input_path, output_path):
         'vocab_size': len(word_vectors)
     }
     
-    print(f"Saving to {output_path}")
+    print(f"Saving to {output_path} (pickle format is faster than numpy...)") 
     with open(output_path, 'wb') as f:
         pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print("Saving complete!")
     
     print(f"Conversion complete!")
     print(f"Vocabulary size: {len(word_vectors)}")
     print(f"Vector dimension: {model.vector_size}")
+    
+    # Get file size
+    import os
+    file_size_mb = os.path.getsize(output_path) / 1024 / 1024
+    print(f"Output file size: {file_size_mb:.2f} MB")
 
 def convert_word2vec_to_json(input_path, output_path):
     """Convert word2vec binary format to JSON format (slower but more portable)"""
