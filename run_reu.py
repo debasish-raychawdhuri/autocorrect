@@ -388,7 +388,7 @@ if __name__ == "__main__":
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--predict", action="store_true")
     parser.add_argument("--data", type=str, default="autogen_char_data.json")
-    parser.add_argument("--word2vec", type=str, required=True)
+    parser.add_argument("--word2vec", type=str, required=True, help="Custom word2vec file (.npz, .pkl, .json)")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--max_word_len", type=int, default=50)
     parser.add_argument("--max_gen_len", type=int, default=50)
@@ -498,8 +498,8 @@ if __name__ == "__main__":
         # Setup device based on arguments
         device, num_gpus = setup_device(args.gpu, args.multi_gpu)
 
-    from gensim.models import KeyedVectors
-    w2v_model = KeyedVectors.load_word2vec_format(args.word2vec, binary=True)
+    from custom_word2vec import load_custom_word2vec
+    w2v_model = load_custom_word2vec(args.word2vec)
     char_to_id, id_to_char = create_charmap()
     char_vocab_size = len(char_to_id)
 
