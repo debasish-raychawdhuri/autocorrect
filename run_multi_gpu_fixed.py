@@ -15,7 +15,11 @@ from concurrent.futures import ProcessPoolExecutor
 # Add current directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from run_reu import *
+# Import only what we need to avoid global device setup
+from run_reu import (
+    create_charmap, pad_context, vectorize_context, one_hot_chars, 
+    ResNetFFN, train_model
+)
 
 class FastParallelDataset(Dataset):
     """Dataset that actually uses parallel processing for data loading"""
