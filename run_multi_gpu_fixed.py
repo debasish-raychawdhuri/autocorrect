@@ -97,16 +97,29 @@ class FastParallelDataset(Dataset):
         all_offsets.sort(key=lambda x: x[1])
         
         # Store total sample count and sparse offsets
-        self.total_samples = all_offsets[-1][1] + 10 if all_offsets else 0  # Approximate
+        if all_offsets:
+            # Find the actual total samples by checking the last indexed position
+            max_line_number = max(line_num for _, line_num in all_offsets)
+            self.total_samples = max_line_number + 10  # Add 10 for the samples after the last index
+        else:
+            self.total_samples = 0
+        
         return [offset for offset, _ in all_offsets]  # Return just the file positions
     
     def __len__(self):
-        return getattr(self, 'total_samples', len(self.offsets) * 10)  # Approximate total samples
+        # Return the actual total samples calculated during indexing
+        return getattr(self, 'total_samples', len(self.offsets) * 10)
     
     def __getitem__(self, idx):
         # Use sparse indexing: find base offset and seek forward
         base_idx = idx // 10
         offset_within_group = idx % 10
+        
+        # Ensure base_idx is within bounds
+        if base_idx >= len(self.offsets):
+            # If out of bounds, use modulo to wrap around
+            base_idx = idx % len(self.offsets)
+            offset_within_group = 0
         
         with open(self.json_path, encoding="utf-8") as f:
             # Seek to base position (every 10th sample)
@@ -114,9 +127,17 @@ class FastParallelDataset(Dataset):
             
             # Skip forward to the exact sample we want
             for _ in range(offset_within_group):
-                f.readline()
+                line = f.readline()
+                if not line:  # Hit EOF while seeking
+                    f.seek(0)
+                    break
             
             line = f.readline()
+            if not line or not line.strip():  # Handle end of file
+                # Wrap around to beginning if we hit EOF
+                f.seek(0)
+                line = f.readline()
+            
             sample = json.loads(line.strip())
         
         context = pad_context(sample["context"], self.ctx_len)
