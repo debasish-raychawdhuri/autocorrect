@@ -42,7 +42,7 @@ class FastParallelDataset(Dataset):
         print(f"Dataset index built with {len(self.offsets)} samples in {end_time - start_time:.2f} seconds")
     
     def _build_offsets_worker(self, args):
-        """Worker function for parallel offset building"""
+        """Worker function for parallel offset building with sparse indexing"""
         json_path, start_pos, end_pos = args
         offsets = []
         
@@ -54,18 +54,24 @@ class FastParallelDataset(Dataset):
                 f.readline()
                 
             pos = f.tell()
+            line_count = 0
             
             while pos < end_pos:
                 line = f.readline()
                 if not line:
                     break
-                offsets.append(pos)
+                
+                # Only index every 10th sample to save memory
+                if line_count % 10 == 0:
+                    offsets.append((pos, line_count))
+                
                 pos = f.tell()
+                line_count += 1
         
         return offsets
     
     def _build_offsets_parallel(self, num_workers):
-        """Build offsets using actual multiprocessing"""
+        """Build offsets using actual multiprocessing with sparse indexing"""
         # Get file size
         file_size = os.path.getsize(self.json_path)
         
@@ -83,18 +89,33 @@ class FastParallelDataset(Dataset):
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
             results = list(executor.map(self._build_offsets_worker, tasks))
             
-        # Combine results
+        # Combine results and sort by line number to maintain order
         for result in results:
             all_offsets.extend(result)
             
-        return sorted(all_offsets)
+        # Sort by line number (second element of tuple)
+        all_offsets.sort(key=lambda x: x[1])
+        
+        # Store total sample count and sparse offsets
+        self.total_samples = all_offsets[-1][1] + 10 if all_offsets else 0  # Approximate
+        return [offset for offset, _ in all_offsets]  # Return just the file positions
     
     def __len__(self):
-        return len(self.offsets)
+        return getattr(self, 'total_samples', len(self.offsets) * 10)  # Approximate total samples
     
     def __getitem__(self, idx):
+        # Use sparse indexing: find base offset and seek forward
+        base_idx = idx // 10
+        offset_within_group = idx % 10
+        
         with open(self.json_path, encoding="utf-8") as f:
-            f.seek(self.offsets[idx])
+            # Seek to base position (every 10th sample)
+            f.seek(self.offsets[base_idx])
+            
+            # Skip forward to the exact sample we want
+            for _ in range(offset_within_group):
+                f.readline()
+            
             line = f.readline()
             sample = json.loads(line.strip())
         
