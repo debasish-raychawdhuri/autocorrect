@@ -98,47 +98,98 @@ def vectorize_context(context_words, w2v_model, ctx_len=10, embed_dim=300):
 # ---- Lazy Dataset ----
 
 class CharGenLazyDataset(Dataset):
-    def __init__(self, json_path, w2v_model, char_to_id, ctx_len=10, max_word_len=50, max_gen_len=50, num_workers=4):
-        self.json_path = json_path
+    def __init__(self, data_path, w2v_model, char_to_id, ctx_len=10, max_word_len=50, max_gen_len=50, num_workers=4):
         self.w2v_model = w2v_model
         self.char_to_id = char_to_id
         self.ctx_len = ctx_len
         self.max_word_len = max_word_len
         self.max_gen_len = max_gen_len
 
-        # Build byte offsets for all lines using multiple processes
-        print(f"Building dataset index with {num_workers} workers...")
+        # Check if data_path is a directory with worker files or a single JSON file
+        import glob
+        import os
+        
+        if os.path.isdir(data_path):
+            # Directory with worker files
+            worker_files = glob.glob(f"{data_path}/worker_*.json")
+            if worker_files:
+                print(f"Found {len(worker_files)} worker files in {data_path}")
+                self.json_files = sorted(worker_files)
+            else:
+                raise ValueError(f"No worker files found in directory: {data_path}")
+        else:
+            # Single JSON file
+            print(f"Using single file: {data_path}")
+            self.json_files = [data_path]
+
+        # Build separate offsets for each file
+        print(f"Building dataset index...")
         start_time = time.time()
         
-        if num_workers > 1:
-            self.offsets = self._build_offsets_parallel(num_workers)
-        else:
-            self.offsets = self._build_offsets_sequential()
+        self.file_offsets = []  # List of offsets per file
+        self.total_samples = 0
+        
+        for json_file in self.json_files:
+            offsets = []
+            with open(json_file, encoding="utf-8") as f:
+                pos = 0
+                for line in f:
+                    offsets.append(pos)
+                    pos += len(line.encode("utf-8"))
+            self.file_offsets.append(offsets)
+            self.total_samples += len(offsets)
             
         end_time = time.time()
-        print(f"Dataset index built with {len(self.offsets)} samples in {end_time - start_time:.2f} seconds")
-
-    def _build_offsets_sequential(self):
-        """Build offsets sequentially"""
-        offsets = []
-        with open(self.json_path, encoding="utf-8") as f:
-            pos = 0
-            for line in f:
-                offsets.append(pos)
-                pos += len(line.encode("utf-8"))
-        return offsets
-    
-    def _build_offsets_parallel(self, num_workers):
-        """Build offsets using multiple processes"""
-        # Fall back to sequential processing for now to avoid pickling issues
-        return self._build_offsets_sequential()
+        print(f"Dataset index built with {self.total_samples} samples from {len(self.json_files)} files in {end_time - start_time:.2f} seconds")
 
     def __len__(self):
-        return len(self.offsets)
+        return self.total_samples
 
     def __getitem__(self, idx):
-        with open(self.json_path, encoding="utf-8") as f:
-            f.seek(self.offsets[idx])
+        # Get current worker info
+        worker_info = torch.utils.data.get_worker_info()
+        
+        if worker_info is None:
+            # Single-threaded: use all files
+            assigned_files = list(range(len(self.json_files)))
+        else:
+            # Multi-threaded: assign files to this worker
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+            
+            # Assign files round-robin: worker 0 gets files 0,num_workers,2*num_workers...
+            assigned_files = [i for i in range(len(self.json_files)) if i % num_workers == worker_id]
+        
+        # Create cumulative sample counts for assigned files
+        cumulative_samples = []
+        total = 0
+        for file_idx in assigned_files:
+            total += len(self.file_offsets[file_idx])
+            cumulative_samples.append(total)
+        
+        # Map global idx to file and local idx within assigned files
+        if idx >= total:
+            # If idx is outside this worker's range, wrap around
+            idx = idx % total if total > 0 else 0
+            
+        # Find which assigned file contains this idx
+        for i, cum_count in enumerate(cumulative_samples):
+            if idx < cum_count:
+                file_idx = assigned_files[i]
+                prev_count = cumulative_samples[i-1] if i > 0 else 0
+                local_idx = idx - prev_count
+                break
+        else:
+            # Fallback to first assigned file
+            file_idx = assigned_files[0] if assigned_files else 0
+            local_idx = 0
+        
+        # Read from the specific file
+        offset = self.file_offsets[file_idx][local_idx]
+        json_file = self.json_files[file_idx]
+        
+        with open(json_file, encoding="utf-8") as f:
+            f.seek(offset)
             line = f.readline()
             sample = json.loads(line.strip())
         context = pad_context(sample["context"], self.ctx_len)

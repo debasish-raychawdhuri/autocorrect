@@ -68,7 +68,7 @@ def worker(args):
         batch.extend(generate_samples_for_sentence(sentence, ctx_len, n_noisy, alphabet))
     return batch
 
-def process_sentences_parallel(in_file, out_file, ctx_len=10, n_noisy=10, num_workers=None, batch_size=1000):
+def process_sentences_parallel(in_file, out_dir, ctx_len=10, n_noisy=10, num_workers=None, batch_size=1000, split_workers=None):
     # Count total sentences for progress tracking
     with open(in_file, encoding="utf-8") as fin:
         total_sentences = sum(1 for line in fin if line.strip())
@@ -76,8 +76,21 @@ def process_sentences_parallel(in_file, out_file, ctx_len=10, n_noisy=10, num_wo
     num_workers = num_workers or multiprocessing.cpu_count()
     alphabet = "abcdefghijklmnopqrstuvwxyz'"
     
-    # Open output file for writing
-    with open(out_file, "w", encoding="utf-8") as fout:
+    # Determine number of output files
+    if split_workers is None:
+        split_workers = num_workers or multiprocessing.cpu_count()
+    
+    # Create output directory
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+    
+    # Create multiple output files in the directory
+    output_files = [f"{out_dir}/worker_{i}.json" for i in range(split_workers)]
+    
+    # Open all output files
+    file_handles = [open(f, "w", encoding="utf-8") for f in output_files]
+    
+    try:
         with open(in_file, encoding="utf-8") as fin:
             sentences_batch = []
             processed_sentences = 0
@@ -95,12 +108,17 @@ def process_sentences_parallel(in_file, out_file, ctx_len=10, n_noisy=10, num_wo
                             chunks = [sentences_batch[i:i+chunk_size] for i in range(0, len(sentences_batch), chunk_size)]
                             args_list = [(chunk, ctx_len, n_noisy, alphabet) for chunk in chunks]
                             
-                            # Process in parallel and write immediately
+                            # Process in parallel and distribute to worker files
                             with multiprocessing.Pool(processes=num_workers) as pool:
                                 all_results = pool.map(worker, args_list)
+                                
+                                # Round-robin distribute samples to worker files
+                                sample_count = 0
                                 for batch_results in all_results:
                                     for sample in batch_results:
-                                        fout.write(json.dumps(sample) + "\n")
+                                        file_idx = sample_count % split_workers
+                                        file_handles[file_idx].write(json.dumps(sample) + "\n")
+                                        sample_count += 1
                             
                             processed_sentences += len(sentences_batch)
                             pbar.update(len(sentences_batch))
@@ -114,22 +132,36 @@ def process_sentences_parallel(in_file, out_file, ctx_len=10, n_noisy=10, num_wo
                     
                     with multiprocessing.Pool(processes=num_workers) as pool:
                         all_results = pool.map(worker, args_list)
+                        
+                        # Round-robin distribute samples to worker files
+                        sample_count = 0
                         for batch_results in all_results:
                             for sample in batch_results:
-                                fout.write(json.dumps(sample) + "\n")
+                                file_idx = sample_count % split_workers
+                                file_handles[file_idx].write(json.dumps(sample) + "\n")
+                                sample_count += 1
                     
                     processed_sentences += len(sentences_batch)
                     pbar.update(len(sentences_batch))
+    finally:
+        # Close all file handles
+        for fh in file_handles:
+            fh.close()
+    
+    print(f"Generated {split_workers} worker files:")
+    for f in output_files:
+        print(f"  {f}")
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--infile", type=str, default="sentences.txt")
-    parser.add_argument("--outfile", type=str, default="autogen_char_data.json")
+    parser.add_argument("--outdir", type=str, default="autogen_char_data_workers", help="Output directory for worker JSON files")
     parser.add_argument("--ctx_len", type=int, default=10)
     parser.add_argument("--n_noisy", type=int, default=10)
     parser.add_argument("--workers", type=int, default=None, help="Number of processes (defaults to all cores)")
     parser.add_argument("--batch_size", type=int, default=1000, help="Number of sentences to process before writing to disk")
+    parser.add_argument("--split_workers", type=int, default=None, help="Number of output files to create for data loading workers")
     args = parser.parse_args()
-    process_sentences_parallel(args.infile, args.outfile, ctx_len=args.ctx_len, n_noisy=args.n_noisy, num_workers=args.workers, batch_size=args.batch_size)
+    process_sentences_parallel(args.infile, args.outdir, ctx_len=args.ctx_len, n_noisy=args.n_noisy, num_workers=args.workers, batch_size=args.batch_size, split_workers=args.split_workers)
 
