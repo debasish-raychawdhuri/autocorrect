@@ -121,15 +121,112 @@ def process_sentences_parallel(in_file, out_file, ctx_len=10, n_noisy=10, num_wo
                     processed_sentences += len(sentences_batch)
                     pbar.update(len(sentences_batch))
 
+def process_sentences_to_multiple_files(in_file, out_dir, num_files=8, ctx_len=10, n_noisy=10, num_workers=None, batch_size=1000):
+    """Process sentences and distribute output across multiple files"""
+    import os
+    
+    # Create output directory
+    os.makedirs(out_dir, exist_ok=True)
+    
+    # Count total sentences for progress tracking
+    with open(in_file, encoding="utf-8") as fin:
+        total_sentences = sum(1 for line in fin if line.strip())
+    
+    num_workers = num_workers or multiprocessing.cpu_count()
+    alphabet = "abcdefghijklmnopqrstuvwxyz'"
+    
+    # Open multiple output files
+    output_files = []
+    file_handles = []
+    for i in range(num_files):
+        filename = os.path.join(out_dir, f"training_data_{i:03d}.json")
+        output_files.append(filename)
+        file_handles.append(open(filename, "w", encoding="utf-8"))
+    
+    try:
+        current_file_idx = 0
+        sample_counts = [0] * num_files
+        
+        with open(in_file, encoding="utf-8") as fin:
+            sentences_batch = []
+            processed_sentences = 0
+            
+            with tqdm(total=total_sentences, desc="Processing sentences") as pbar:
+                for line in fin:
+                    sentence = line.strip()
+                    if sentence:
+                        sentences_batch.append(sentence)
+                        
+                        # Process batch when it reaches batch_size
+                        if len(sentences_batch) >= batch_size:
+                            # Create chunks for multiprocessing
+                            chunk_size = math.ceil(len(sentences_batch) / num_workers)
+                            chunks = [sentences_batch[i:i+chunk_size] for i in range(0, len(sentences_batch), chunk_size)]
+                            args_list = [(chunk, ctx_len, n_noisy, alphabet) for chunk in chunks]
+                            
+                            # Process in parallel and distribute across files
+                            with multiprocessing.Pool(processes=num_workers) as pool:
+                                all_results = pool.map(worker, args_list)
+                                for batch_results in all_results:
+                                    for sample in batch_results:
+                                        file_handles[current_file_idx].write(json.dumps(sample) + "\n")
+                                        sample_counts[current_file_idx] += 1
+                                        current_file_idx = (current_file_idx + 1) % num_files
+                            
+                            processed_sentences += len(sentences_batch)
+                            pbar.update(len(sentences_batch))
+                            sentences_batch = []  # Clear batch from memory
+                
+                # Process remaining sentences
+                if sentences_batch:
+                    chunk_size = math.ceil(len(sentences_batch) / num_workers)
+                    chunks = [sentences_batch[i:i+chunk_size] for i in range(0, len(sentences_batch), chunk_size)]
+                    args_list = [(chunk, ctx_len, n_noisy, alphabet) for chunk in chunks]
+                    
+                    with multiprocessing.Pool(processes=num_workers) as pool:
+                        all_results = pool.map(worker, args_list)
+                        for batch_results in all_results:
+                            for sample in batch_results:
+                                file_handles[current_file_idx].write(json.dumps(sample) + "\n")
+                                sample_counts[current_file_idx] += 1
+                                current_file_idx = (current_file_idx + 1) % num_files
+                    
+                    processed_sentences += len(sentences_batch)
+                    pbar.update(len(sentences_batch))
+    
+    finally:
+        # Close all file handles
+        for fh in file_handles:
+            fh.close()
+    
+    # Print summary
+    total_samples = sum(sample_counts)
+    total_size = 0
+    print(f"\nOutput files created in {out_dir}:")
+    for i, (filename, count) in enumerate(zip(output_files, sample_counts)):
+        size = os.path.getsize(filename)
+        total_size += size
+        print(f"  training_data_{i:03d}.json: {count:,} samples, {size / (1024**2):.1f} MB")
+    
+    print(f"\nTotal: {total_samples:,} samples across {num_files} files, {total_size / (1024**2):.1f} MB")
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--infile", type=str, default="sentences.txt")
     parser.add_argument("--outfile", type=str, default="autogen_char_data.json")
+    parser.add_argument("--outdir", type=str, default="training_data", help="Output directory for multiple files")
+    parser.add_argument("--dataloader_workers", type=int, default=8, help="Number of DataLoader workers (determines number of output files)")
     parser.add_argument("--ctx_len", type=int, default=10)
     parser.add_argument("--n_noisy", type=int, default=10)
-    parser.add_argument("--workers", type=int, default=None, help="Number of processes (defaults to all cores)")
+    parser.add_argument("--workers", type=int, default=None, help="Number of processes for generation (defaults to all cores)")
     parser.add_argument("--batch_size", type=int, default=1000, help="Number of sentences to process before writing to disk")
+    parser.add_argument("--multi_files", action="store_true", help="Generate multiple files for DataLoader workers")
     args = parser.parse_args()
-    process_sentences_parallel(args.infile, args.outfile, ctx_len=args.ctx_len, n_noisy=args.n_noisy, num_workers=args.workers, batch_size=args.batch_size)
+    
+    if args.multi_files:
+        # Create as many files as there will be DataLoader workers
+        process_sentences_to_multiple_files(args.infile, args.outdir, args.dataloader_workers, ctx_len=args.ctx_len, n_noisy=args.n_noisy, num_workers=args.workers, batch_size=args.batch_size)
+    else:
+        process_sentences_parallel(args.infile, args.outfile, ctx_len=args.ctx_len, n_noisy=args.n_noisy, num_workers=args.workers, batch_size=args.batch_size)
 

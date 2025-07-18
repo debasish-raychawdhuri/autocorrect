@@ -58,8 +58,8 @@ def get_distributed_info():
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"✅ Initial device setup: {device}")
 
-# Custom birely activation function: birely(x) = relu(x) - 0.3 * relu(-x)
-def birely(x):
+# Custom birelu activation function: birelu(x) = relu(x) - 0.3 * relu(-x)
+def birelu(x):
     return F.relu(x) - 0.3 * F.relu(-x)
 
 # ---- Char Map ----
@@ -98,30 +98,71 @@ def vectorize_context(context_words, w2v_model, ctx_len=10, embed_dim=300):
 # ---- Lazy Dataset ----
 
 class CharGenLazyDataset(Dataset):
-    def __init__(self, json_path, w2v_model, char_to_id, ctx_len=10, max_word_len=50, max_gen_len=50, num_workers=4):
-        self.json_path = json_path
+    def __init__(self, data_dir, w2v_model, char_to_id, ctx_len=10, max_word_len=50, max_gen_len=50, num_workers=4):
+        # Handle both single file and directory input
+        if os.path.isfile(data_dir):
+            # Single file mode (backward compatibility)
+            self.file_paths = [data_dir]
+            self.use_worker_files = False
+        else:
+            # Multiple files mode - each worker gets its own file
+            self.file_paths = []
+            for filename in sorted(os.listdir(data_dir)):
+                if filename.endswith('.json'):
+                    self.file_paths.append(os.path.join(data_dir, filename))
+            self.use_worker_files = True
+        
+        print(f"Found {len(self.file_paths)} data files, worker-specific files: {self.use_worker_files}")
+        
         self.w2v_model = w2v_model
         self.char_to_id = char_to_id
         self.ctx_len = ctx_len
         self.max_word_len = max_word_len
         self.max_gen_len = max_gen_len
+        self.num_workers = num_workers
 
-        # Build byte offsets for all lines using multiple processes
-        print(f"Building dataset index with {num_workers} workers...")
-        start_time = time.time()
-        
-        if num_workers > 1:
-            self.offsets = self._build_offsets_parallel(num_workers)
-        else:
-            self.offsets = self._build_offsets_sequential()
+        if self.use_worker_files:
+            # Build separate indices for each file
+            print(f"Building separate indices for {len(self.file_paths)} worker files...")
+            start_time = time.time()
+            self.file_offsets = []
+            self.file_lengths = []
             
-        end_time = time.time()
-        print(f"Dataset index built with {len(self.offsets)} samples in {end_time - start_time:.2f} seconds")
+            for file_path in self.file_paths:
+                offsets = self._build_offsets_for_file(file_path)
+                self.file_offsets.append(offsets)
+                self.file_lengths.append(len(offsets))
+            
+            self.total_length = sum(self.file_lengths)
+            end_time = time.time()
+            print(f"Dataset indices built: {self.total_length} total samples in {end_time - start_time:.2f} seconds")
+        else:
+            # Single file mode
+            print(f"Building dataset index with {num_workers} workers...")
+            start_time = time.time()
+            
+            if num_workers > 1:
+                self.offsets = self._build_offsets_parallel(num_workers)
+            else:
+                self.offsets = self._build_offsets_sequential()
+                
+            end_time = time.time()
+            print(f"Dataset index built with {len(self.offsets)} samples in {end_time - start_time:.2f} seconds")
+
+    def _build_offsets_for_file(self, file_path):
+        """Build offsets for a single file"""
+        offsets = []
+        with open(file_path, encoding="utf-8") as f:
+            pos = 0
+            for line in f:
+                offsets.append(pos)
+                pos += len(line.encode("utf-8"))
+        return offsets
 
     def _build_offsets_sequential(self):
         """Build offsets sequentially"""
         offsets = []
-        with open(self.json_path, encoding="utf-8") as f:
+        with open(self.file_paths[0], encoding="utf-8") as f:
             pos = 0
             for line in f:
                 offsets.append(pos)
@@ -134,13 +175,44 @@ class CharGenLazyDataset(Dataset):
         return self._build_offsets_sequential()
 
     def __len__(self):
-        return len(self.offsets)
+        if self.use_worker_files:
+            return self.total_length
+        else:
+            return len(self.offsets)
 
     def __getitem__(self, idx):
-        with open(self.json_path, encoding="utf-8") as f:
-            f.seek(self.offsets[idx])
-            line = f.readline()
-            sample = json.loads(line.strip())
+        if self.use_worker_files:
+            # Find which file and offset within that file
+            worker_id = torch.utils.data.get_worker_info()
+            if worker_id is not None:
+                # Use worker-specific file
+                file_idx = worker_id.id % len(self.file_paths)
+                file_path = self.file_paths[file_idx]
+                offsets = self.file_offsets[file_idx]
+                local_idx = idx % len(offsets)
+            else:
+                # Fallback for main process
+                cumulative = 0
+                for file_idx, length in enumerate(self.file_lengths):
+                    if idx < cumulative + length:
+                        file_path = self.file_paths[file_idx]
+                        offsets = self.file_offsets[file_idx]
+                        local_idx = idx - cumulative
+                        break
+                    cumulative += length
+                else:
+                    raise IndexError(f"Index {idx} out of range")
+            
+            with open(file_path, encoding="utf-8") as f:
+                f.seek(offsets[local_idx])
+                line = f.readline()
+                sample = json.loads(line.strip())
+        else:
+            # Single file mode
+            with open(self.file_paths[0], encoding="utf-8") as f:
+                f.seek(self.offsets[idx])
+                line = f.readline()
+                sample = json.loads(line.strip())
         context = pad_context(sample["context"], self.ctx_len)
         misspelled = sample["misspelled"]
         prefix = sample["generated_prefix"]
@@ -171,7 +243,7 @@ class ResNetFFN(nn.Module):
             nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.LayerNorm(hidden_dim),
-                # Replace ReLU with birely activation function
+                # Replace ReLU with birelu activation function
                 nn.ReLU()
             ) for _ in range(num_layers)
         ])
@@ -181,10 +253,10 @@ class ResNetFFN(nn.Module):
         x = torch.cat([context_vec, misspelled_oh, prefix_oh], dim=1)
         x = self.input_proj(x)
         for layer in self.layers:
-            # Apply the custom birely activation instead of the ReLU in the layer
+            # Apply the custom birelu activation instead of the ReLU in the layer
             layer_output = layer[0](x)  # Linear
             layer_output = layer[1](layer_output)  # LayerNorm
-            layer_output = birely(layer_output)  # birely instead of ReLU
+            layer_output = birelu(layer_output)  # birelu instead of ReLU
             x = x + layer_output
         logits = self.output_layer(x)
         return logits
@@ -387,7 +459,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--predict", action="store_true")
-    parser.add_argument("--data", type=str, default="autogen_char_data.json")
+    parser.add_argument("--data_dir", type=str, default="training_data", help="Directory containing training data files or single JSON file")
     parser.add_argument("--word2vec", type=str, required=True, help="Custom word2vec file (.npz, .pkl, .json)")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--max_word_len", type=int, default=50)
@@ -635,7 +707,7 @@ if __name__ == "__main__":
         # Create dataset with parallel processing
         print(f"Creating dataset with {args.num_workers} workers for initialization...")
         dataset = CharGenLazyDataset(
-            args.data, 
+            args.data_dir, 
             w2v_model, 
             char_to_id,
             ctx_len=args.ctx_len, 
