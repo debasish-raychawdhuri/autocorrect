@@ -97,7 +97,8 @@ def process_sentences_parallel(in_file, out_file, ctx_len=10, n_noisy=10, num_wo
                             
                             # Process in parallel and write immediately
                             with multiprocessing.Pool(processes=num_workers) as pool:
-                                for batch_results in pool.imap_unordered(worker, args_list):
+                                all_results = pool.map(worker, args_list)
+                                for batch_results in all_results:
                                     for sample in batch_results:
                                         fout.write(json.dumps(sample) + "\n")
                             
@@ -112,7 +113,8 @@ def process_sentences_parallel(in_file, out_file, ctx_len=10, n_noisy=10, num_wo
                     args_list = [(chunk, ctx_len, n_noisy, alphabet) for chunk in chunks]
                     
                     with multiprocessing.Pool(processes=num_workers) as pool:
-                        for batch_results in pool.imap_unordered(worker, args_list):
+                        all_results = pool.map(worker, args_list)
+                        for batch_results in all_results:
                             for sample in batch_results:
                                 fout.write(json.dumps(sample) + "\n")
                     
