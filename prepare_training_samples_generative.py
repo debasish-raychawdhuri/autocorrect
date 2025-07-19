@@ -199,16 +199,38 @@ def process_sentences_to_multiple_files(in_file, out_dir, num_files=8, ctx_len=1
         for fh in file_handles:
             fh.close()
     
-    # Print summary
+    # Print summary and create metadata
     total_samples = sum(sample_counts)
     total_size = 0
+    metadata = {
+        "total_samples": total_samples,
+        "total_files": num_files,
+        "files": []
+    }
+    
     print(f"\nOutput files created in {out_dir}:")
     for i, (filename, count) in enumerate(zip(output_files, sample_counts)):
         size = os.path.getsize(filename)
         total_size += size
+        
+        # Add to metadata
+        metadata["files"].append({
+            "filename": f"training_data_{i:03d}.json",
+            "samples": count,
+            "size_bytes": size
+        })
+        
         print(f"  training_data_{i:03d}.json: {count:,} samples, {size / (1024**2):.1f} MB")
     
+    metadata["total_size_bytes"] = total_size
+    
+    # Save metadata file
+    metadata_path = os.path.join(out_dir, "metadata.json")
+    with open(metadata_path, "w") as meta_file:
+        json.dump(metadata, meta_file, indent=2)
+    
     print(f"\nTotal: {total_samples:,} samples across {num_files} files, {total_size / (1024**2):.1f} MB")
+    print(f"📊 Metadata saved to: {metadata_path}")
 
 if __name__ == "__main__":
     import argparse

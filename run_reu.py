@@ -121,28 +121,40 @@ class CharGenLazyDataset(Dataset):
         self.max_gen_len = max_gen_len
         self.num_workers = num_workers
 
-        # For streaming mode, we don't build indices - just estimate dataset size
+        # For streaming mode, read exact sample counts from metadata
         if self.use_worker_files:
             print(f"Using streaming mode with {len(self.file_paths)} worker files...")
-            # Quick estimate of total samples by reading first few lines of each file
-            self.estimated_total = 0
-            for file_path in self.file_paths:
-                with open(file_path, encoding="utf-8") as f:
-                    sample_lines = 0
-                    for i, line in enumerate(f):
-                        sample_lines += 1
-                        if i >= 1000:  # Sample first 1000 lines
-                            break
-                    
-                    # Get file size and estimate total lines
-                    f.seek(0, 2)  # Seek to end
-                    file_size = f.tell()
-                    if sample_lines > 0:
-                        avg_line_size = f.tell() / sample_lines if i >= 1000 else file_size / sample_lines
-                        estimated_lines = int(file_size / avg_line_size) if avg_line_size > 0 else sample_lines
-                        self.estimated_total += estimated_lines
-                    
-            print(f"Estimated total samples: {self.estimated_total:,} (streaming mode)")
+            
+            # Try to read metadata file for exact counts
+            data_dir = os.path.dirname(self.file_paths[0]) if self.file_paths else "."
+            metadata_path = os.path.join(data_dir, "metadata.json")
+            
+            if os.path.exists(metadata_path):
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                self.total_samples = metadata["total_samples"]
+                self.file_metadata = {f["filename"]: f["samples"] for f in metadata["files"]}
+                print(f"Loaded metadata: {self.total_samples:,} total samples across {len(self.file_paths)} files")
+            else:
+                # Fallback to quick estimation if no metadata
+                print("No metadata.json found, using quick estimation...")
+                self.total_samples = 0
+                for file_path in self.file_paths:
+                    with open(file_path, encoding="utf-8") as f:
+                        sample_lines = 0
+                        for i, line in enumerate(f):
+                            sample_lines += 1
+                            if i >= 1000:
+                                break
+                        
+                        f.seek(0, 2)
+                        file_size = f.tell()
+                        if sample_lines > 0:
+                            avg_line_size = f.tell() / sample_lines if i >= 1000 else file_size / sample_lines
+                            estimated_lines = int(file_size / avg_line_size) if avg_line_size > 0 else sample_lines
+                            self.total_samples += estimated_lines
+                
+                print(f"Estimated total samples: {self.total_samples:,} (no metadata available)")
         else:
             # Single file mode still uses indexing for compatibility
             print(f"Building dataset index with {num_workers} workers...")
@@ -183,7 +195,7 @@ class CharGenLazyDataset(Dataset):
 
     def __len__(self):
         if self.use_worker_files:
-            return self.estimated_total
+            return self.total_samples
         else:
             return len(self.offsets)
 
