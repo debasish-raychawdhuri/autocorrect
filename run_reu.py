@@ -207,9 +207,9 @@ class CharGenStreamingDataset(IterableDataset):
             # Single process mode - use first file
             file_path = self.file_paths[0]
         
-        # Infinite streaming loop
-        while True:
-            with open(file_path, encoding="utf-8") as f:
+        # Open file ONCE and stream infinitely
+        with open(file_path, encoding="utf-8") as f:
+            while True:
                 for line in f:
                     sample = json.loads(line.strip())
                     context = pad_context(sample["context"], self.ctx_len)
@@ -231,6 +231,8 @@ class CharGenStreamingDataset(IterableDataset):
                         torch.tensor(prefix_oh, dtype=torch.float32),
                         torch.tensor(next_id, dtype=torch.long)
                     )
+                # Reset to beginning of file when done
+                f.seek(0)
 
 # ---- Model ----
 
