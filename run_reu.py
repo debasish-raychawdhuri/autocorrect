@@ -108,7 +108,7 @@ class CharGenStreamingDataset(IterableDataset):
             # Multiple files mode - each worker gets its own file
             self.file_paths = []
             for filename in sorted(os.listdir(data_dir)):
-                if filename.endswith('.json'):
+                if filename.endswith('.json') and filename != 'metadata.json':
                     self.file_paths.append(os.path.join(data_dir, filename))
             self.use_worker_files = True
         
