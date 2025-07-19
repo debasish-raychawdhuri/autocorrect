@@ -13,6 +13,7 @@ from tqdm import tqdm
 import string
 import os
 import time
+import signal
 from datetime import timedelta
 
 # Set up device
@@ -272,6 +273,17 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
     # Track best model (only save on rank 0 if distributed)
     best_loss = float('inf')
     
+    # Global flag for save on demand
+    save_requested = [False]
+    
+    def save_on_demand(signum, frame):
+        save_requested[0] = True
+        print("\n💾 Save requested! Will save model after current batch...")
+    
+    # Set up Ctrl+S handler (SIGUSR1 is more reliable than trying to capture Ctrl+S)
+    # Use: kill -USR1 <pid> to trigger save
+    signal.signal(signal.SIGUSR1, save_on_demand)
+    
     # Set up data prefetcher for faster data loading
     from torch.utils.data import DataLoader, Dataset
     
@@ -336,6 +348,18 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
                 if not is_distributed or local_rank == 0:
                     if isinstance(loop, tqdm):
                         loop.set_postfix(loss=loss.item())
+                
+                # Check if save was requested (only save on main process)
+                if save_requested[0] and (not is_distributed or local_rank == 0):
+                    print(f"\n💾 Saving model on demand...")
+                    if is_distributed:
+                        # Save the module without DDP wrapper
+                        torch.save(model.module.state_dict(), save_path)
+                    else:
+                        # Save regular model
+                        torch.save(model.state_dict(), save_path)
+                    print(f"✅ Model saved to {save_path}")
+                    save_requested[0] = False
                         
             except RuntimeError as e:
                 if "CUDA" in str(e) or "illegal memory access" in str(e):
