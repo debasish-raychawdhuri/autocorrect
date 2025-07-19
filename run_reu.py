@@ -212,32 +212,29 @@ class CharGenStreamingDataset(IterableDataset):
             # Single process mode - use first file
             file_path = self.file_paths[0]
         
-        # Open file ONCE and stream infinitely with large buffer
+        # Open file ONCE and read through it exactly once per epoch
         with open(file_path, encoding="utf-8", buffering=8*1024*1024) as f:  # 8MB buffer
-            while True:
-                for line in f:
-                    sample = json.loads(line.strip())
-                    context = pad_context(sample["context"], self.ctx_len)
-                    misspelled = sample["misspelled"]
-                    prefix = sample["generated_prefix"]
-                    next_char = sample["next_char"]
-                    context_vec = vectorize_context(context, self.w2v_model, self.ctx_len)
-                    misspelled_oh = one_hot_chars(misspelled, self.char_to_id, self.max_word_len)
-                    prefix_oh = one_hot_chars(prefix, self.char_to_id, self.max_gen_len)
-                    
-                    if next_char == "<eow>":
-                        next_id = self.char_to_id["<eow>"]
-                    else:
-                        next_id = self.char_to_id.get(next_char, 0)
-                    
-                    yield (
-                        torch.tensor(context_vec, dtype=torch.float32),
-                        torch.tensor(misspelled_oh, dtype=torch.float32),
-                        torch.tensor(prefix_oh, dtype=torch.float32),
-                        torch.tensor(next_id, dtype=torch.long)
-                    )
-                # Reset to beginning of file when done
-                f.seek(0)
+            for line in f:
+                sample = json.loads(line.strip())
+                context = pad_context(sample["context"], self.ctx_len)
+                misspelled = sample["misspelled"]
+                prefix = sample["generated_prefix"]
+                next_char = sample["next_char"]
+                context_vec = vectorize_context(context, self.w2v_model, self.ctx_len)
+                misspelled_oh = one_hot_chars(misspelled, self.char_to_id, self.max_word_len)
+                prefix_oh = one_hot_chars(prefix, self.char_to_id, self.max_gen_len)
+                
+                if next_char == "<eow>":
+                    next_id = self.char_to_id["<eow>"]
+                else:
+                    next_id = self.char_to_id.get(next_char, 0)
+                
+                yield (
+                    torch.tensor(context_vec, dtype=torch.float32),
+                    torch.tensor(misspelled_oh, dtype=torch.float32),
+                    torch.tensor(prefix_oh, dtype=torch.float32),
+                    torch.tensor(next_id, dtype=torch.long)
+                )
 
 # ---- Model ----
 
