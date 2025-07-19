@@ -207,8 +207,8 @@ class CharGenStreamingDataset(IterableDataset):
             # Single process mode - use first file
             file_path = self.file_paths[0]
         
-        # Open file ONCE and stream infinitely
-        with open(file_path, encoding="utf-8") as f:
+        # Open file ONCE and stream infinitely with large buffer
+        with open(file_path, encoding="utf-8", buffering=8*1024*1024) as f:  # 8MB buffer
             while True:
                 for line in f:
                     sample = json.loads(line.strip())
