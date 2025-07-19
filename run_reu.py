@@ -62,6 +62,11 @@ print(f"✅ Initial device setup: {device}")
 def birelu(x):
     return F.relu(x) - 0.3 * F.relu(-x)
 
+class BiReLU(nn.Module):
+    """BiReLU activation module for use in nn.Sequential"""
+    def forward(self, x):
+        return F.relu(x) - 0.3 * F.relu(-x)
+
 # ---- Char Map ----
 
 def create_charmap():
@@ -245,8 +250,7 @@ class ResNetFFN(nn.Module):
             nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.LayerNorm(hidden_dim),
-                # Replace ReLU with birelu activation function
-                nn.ReLU()
+                BiReLU()
             ) for _ in range(num_layers)
         ])
         self.output_layer = nn.Linear(hidden_dim, char_vocab_size)
@@ -255,10 +259,8 @@ class ResNetFFN(nn.Module):
         x = torch.cat([context_vec, misspelled_oh, prefix_oh], dim=1)
         x = self.input_proj(x)
         for layer in self.layers:
-            # Apply the custom birelu activation instead of the ReLU in the layer
-            layer_output = layer[0](x)  # Linear
-            layer_output = layer[1](layer_output)  # LayerNorm
-            layer_output = birelu(layer_output)  # birelu instead of ReLU
+            # ResNet connection with BiReLU activation
+            layer_output = layer(x)  # Linear -> LayerNorm -> BiReLU
             x = x + layer_output
         logits = self.output_layer(x)
         return logits
