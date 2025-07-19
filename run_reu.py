@@ -121,23 +121,30 @@ class CharGenLazyDataset(Dataset):
         self.max_gen_len = max_gen_len
         self.num_workers = num_workers
 
+        # For streaming mode, we don't build indices - just estimate dataset size
         if self.use_worker_files:
-            # Build separate indices for each file
-            print(f"Building separate indices for {len(self.file_paths)} worker files...")
-            start_time = time.time()
-            self.file_offsets = []
-            self.file_lengths = []
-            
+            print(f"Using streaming mode with {len(self.file_paths)} worker files...")
+            # Quick estimate of total samples by reading first few lines of each file
+            self.estimated_total = 0
             for file_path in self.file_paths:
-                offsets = self._build_offsets_for_file(file_path)
-                self.file_offsets.append(offsets)
-                self.file_lengths.append(len(offsets))
-            
-            self.total_length = sum(self.file_lengths)
-            end_time = time.time()
-            print(f"Dataset indices built: {self.total_length} total samples in {end_time - start_time:.2f} seconds")
+                with open(file_path, encoding="utf-8") as f:
+                    sample_lines = 0
+                    for i, line in enumerate(f):
+                        sample_lines += 1
+                        if i >= 1000:  # Sample first 1000 lines
+                            break
+                    
+                    # Get file size and estimate total lines
+                    f.seek(0, 2)  # Seek to end
+                    file_size = f.tell()
+                    if sample_lines > 0:
+                        avg_line_size = f.tell() / sample_lines if i >= 1000 else file_size / sample_lines
+                        estimated_lines = int(file_size / avg_line_size) if avg_line_size > 0 else sample_lines
+                        self.estimated_total += estimated_lines
+                    
+            print(f"Estimated total samples: {self.estimated_total:,} (streaming mode)")
         else:
-            # Single file mode
+            # Single file mode still uses indexing for compatibility
             print(f"Building dataset index with {num_workers} workers...")
             start_time = time.time()
             
@@ -176,39 +183,53 @@ class CharGenLazyDataset(Dataset):
 
     def __len__(self):
         if self.use_worker_files:
-            return self.total_length
+            return self.estimated_total
         else:
             return len(self.offsets)
 
     def __getitem__(self, idx):
         if self.use_worker_files:
-            # Find which file and offset within that file
-            worker_id = torch.utils.data.get_worker_info()
-            if worker_id is not None:
-                # Use worker-specific file
-                file_idx = worker_id.id % len(self.file_paths)
+            # Streaming mode: ignore idx, read sequentially from worker's file
+            worker_info = torch.utils.data.get_worker_info()
+            if worker_info is not None:
+                # Use worker-specific file for streaming
+                file_idx = worker_info.id % len(self.file_paths)
                 file_path = self.file_paths[file_idx]
-                offsets = self.file_offsets[file_idx]
-                local_idx = idx % len(offsets)
+                
+                # Initialize file iterator if not exists
+                if not hasattr(self, '_file_iterators'):
+                    self._file_iterators = {}
+                
+                if file_idx not in self._file_iterators:
+                    self._file_iterators[file_idx] = open(file_path, encoding="utf-8")
+                
+                # Read next line from the file
+                try:
+                    line = next(self._file_iterators[file_idx])
+                    sample = json.loads(line.strip())
+                except StopIteration:
+                    # Restart from beginning of file
+                    self._file_iterators[file_idx].close()
+                    self._file_iterators[file_idx] = open(file_path, encoding="utf-8")
+                    line = next(self._file_iterators[file_idx])
+                    sample = json.loads(line.strip())
             else:
-                # Fallback for main process
-                cumulative = 0
-                for file_idx, length in enumerate(self.file_lengths):
-                    if idx < cumulative + length:
-                        file_path = self.file_paths[file_idx]
-                        offsets = self.file_offsets[file_idx]
-                        local_idx = idx - cumulative
-                        break
-                    cumulative += length
-                else:
-                    raise IndexError(f"Index {idx} out of range")
-            
-            with open(file_path, encoding="utf-8") as f:
-                f.seek(offsets[local_idx])
-                line = f.readline()
-                sample = json.loads(line.strip())
+                # Fallback for main process - use first file with seeking
+                file_path = self.file_paths[0]
+                # For main process, we'll still use some basic indexing
+                # This is a simplified fallback
+                with open(file_path, encoding="utf-8") as f:
+                    for i, line in enumerate(f):
+                        if i == idx % 1000:  # Simple modulo for main process
+                            sample = json.loads(line.strip())
+                            break
+                    else:
+                        # If we don't find the line, use the first line
+                        f.seek(0)
+                        line = f.readline()
+                        sample = json.loads(line.strip())
         else:
-            # Single file mode
+            # Single file mode with indexing
             with open(self.file_paths[0], encoding="utf-8") as f:
                 f.seek(self.offsets[idx])
                 line = f.readline()
@@ -231,6 +252,13 @@ class CharGenLazyDataset(Dataset):
             torch.tensor(prefix_oh, dtype=torch.float32),
             torch.tensor(next_id, dtype=torch.long)
         )
+    
+    def __del__(self):
+        """Clean up file iterators when dataset is destroyed"""
+        if hasattr(self, '_file_iterators'):
+            for f in self._file_iterators.values():
+                if f and not f.closed:
+                    f.close()
 
 # ---- Model ----
 
@@ -672,7 +700,7 @@ if __name__ == "__main__":
         if model_exists:
             print(f"Model file '{model_path}' found, checking compatibility...")
             try:
-                checkpoint = torch.load(model_path, map_location=device)
+                checkpoint = torch.load(model_path, map_location=device, weights_only=False)
                 # If saved as state_dict only
                 if isinstance(checkpoint, dict) and "model" in checkpoint:
                     checkpoint = checkpoint["model"]
@@ -763,7 +791,7 @@ if __name__ == "__main__":
             model = model.module
         
         # Load the model weights
-        model.load_state_dict(torch.load(args.model, map_location=device))
+        model.load_state_dict(torch.load(args.model, map_location=device, weights_only=False))
         model.eval()
         
         print("Interactive prediction mode. Press Ctrl+C to exit.")
