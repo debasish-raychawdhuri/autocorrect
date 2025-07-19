@@ -471,6 +471,9 @@ if __name__ == "__main__":
     parser.add_argument("--ctx_len", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--model", type=str, default="char_autocorrect.pt")
+    # Add model architecture arguments
+    parser.add_argument("--hidden_dim", type=int, default=600, help="Hidden layer width")
+    parser.add_argument("--num_layers", type=int, default=30, help="Number of hidden layers")
     # Add multi-GPU arguments
     parser.add_argument("--multi_gpu", action="store_true", help="Use multiple GPUs with DataParallel")
     parser.add_argument("--distributed", action="store_true", help="Use DistributedDataParallel for multi-GPU training")
@@ -589,8 +592,8 @@ if __name__ == "__main__":
         word_onehot_dim=word_onehot_dim,
         gen_onehot_dim=gen_onehot_dim,
         char_vocab_size=char_vocab_size,
-        hidden_dim=600,
-        num_layers=30
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers
     ).to(device)
 
     # Wrap model for multi-GPU training with fallback strategy
