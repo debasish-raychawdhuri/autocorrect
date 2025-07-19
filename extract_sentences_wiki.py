@@ -2,6 +2,8 @@ import os
 import nltk
 from nltk.tokenize import sent_tokenize
 from tqdm import tqdm
+import random
+import argparse
 
 # -------- CONFIG --------
 WIKI_DIR = "./wikipedia"
@@ -11,7 +13,7 @@ MAX_LEN = 300    # maximum sentence length (characters)
 BATCH_SIZE = 10000  # process sentences in batches to manage memory
 # -------------------------
 
-def extract_sentences_from_text(text):
+def extract_sentences_from_text(text, selection_probability=1.0):
     """Extract sentences from text using NLTK sentence tokenizer"""
     sentences = sent_tokenize(text)
     sentences = [s.strip().replace("\n", " ").replace("\r", " ") for s in sentences]
@@ -22,12 +24,14 @@ def extract_sentences_from_text(text):
             # Basic quality filter: sentence should be mostly alphabetic
             alpha_ratio = sum(c.isalpha() or c.isspace() for c in s) / len(s)
             if alpha_ratio > 0.7:  # At least 70% alphabetic characters + spaces
-                filtered_sentences.append(s)
+                # Apply selection probability
+                if random.random() <= selection_probability:
+                    filtered_sentences.append(s)
     return filtered_sentences
 
-def process_large_file(file_path, output_file):
+def process_large_file(file_path, output_file, selection_probability=1.0):
     """Process large wiki file in chunks to manage memory"""
-    print(f"📖 Processing: {file_path}")
+    print(f"📖 Processing: {file_path} (selection probability: {selection_probability})")
     
     sentence_count = 0
     chunk_size = 1024 * 1024  # 1MB chunks
@@ -52,7 +56,7 @@ def process_large_file(file_path, output_file):
                 # Process complete paragraphs
                 for paragraph in paragraphs[:-1]:
                     if paragraph.strip():
-                        sentences = extract_sentences_from_text(paragraph)
+                        sentences = extract_sentences_from_text(paragraph, selection_probability)
                         for sentence in sentences:
                             outfile.write(sentence + '\n')
                             sentence_count += 1
@@ -62,7 +66,7 @@ def process_large_file(file_path, output_file):
             
             # Process remaining text in buffer
             if text_buffer.strip():
-                sentences = extract_sentences_from_text(text_buffer)
+                sentences = extract_sentences_from_text(text_buffer, selection_probability)
                 for sentence in sentences:
                     outfile.write(sentence + '\n')
                     sentence_count += 1
@@ -70,39 +74,48 @@ def process_large_file(file_path, output_file):
     return sentence_count
 
 def main():
-    print("🚀 Starting Wikipedia sentence extraction...")
+    parser = argparse.ArgumentParser(description="Extract sentences from Wikipedia text files")
+    parser.add_argument("--selection_probability", type=float, default=1.0, 
+                       help="Probability of selecting each sentence (0.0-1.0, default: 1.0)")
+    parser.add_argument("--wiki_dir", type=str, default="./wikipedia",
+                       help="Directory containing Wikipedia text files")
+    parser.add_argument("--output", type=str, default="./wiki_sentences.txt",
+                       help="Output file for extracted sentences")
+    args = parser.parse_args()
+    
+    print(f"🚀 Starting Wikipedia sentence extraction with selection probability: {args.selection_probability}")
     
     total_sentences = 0
     
     # Process all text files in wiki directory
-    for fname in os.listdir(WIKI_DIR):
+    for fname in os.listdir(args.wiki_dir):
         if fname.endswith(".txt"):
-            file_path = os.path.join(WIKI_DIR, fname)
+            file_path = os.path.join(args.wiki_dir, fname)
             
             # For the first file, create new output file; for subsequent files, append
             mode = 'w' if total_sentences == 0 else 'a'
-            temp_output = OUTPUT_FILE + '.tmp'
+            temp_output = args.output + '.tmp'
             
             if total_sentences == 0:
-                sentence_count = process_large_file(file_path, OUTPUT_FILE)
+                sentence_count = process_large_file(file_path, args.output, args.selection_probability)
             else:
                 # Append to existing file
-                sentence_count = process_large_file(file_path, temp_output)
+                sentence_count = process_large_file(file_path, temp_output, args.selection_probability)
                 # Append temp file to main output file
                 with open(temp_output, 'r', encoding='utf-8') as temp_file:
-                    with open(OUTPUT_FILE, 'a', encoding='utf-8') as main_file:
+                    with open(args.output, 'a', encoding='utf-8') as main_file:
                         main_file.write(temp_file.read())
                 os.remove(temp_output)
             
             total_sentences += sentence_count
             print(f"  📊 Extracted {sentence_count:,} sentences from {fname}")
 
-    print(f"\n✅ Total extracted: {total_sentences:,} sentences from {WIKI_DIR}")
-    print(f"📁 Saved to: {OUTPUT_FILE}")
+    print(f"\n✅ Total extracted: {total_sentences:,} sentences from {args.wiki_dir}")
+    print(f"📁 Saved to: {args.output}")
     
     # Print file size info
-    if os.path.exists(OUTPUT_FILE):
-        file_size = os.path.getsize(OUTPUT_FILE)
+    if os.path.exists(args.output):
+        file_size = os.path.getsize(args.output)
         print(f"📏 Output file size: {file_size / (1024*1024):.1f} MB")
 
 if __name__ == "__main__":
