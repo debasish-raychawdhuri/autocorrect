@@ -8,7 +8,7 @@ from torch.utils.data.distributed import DistributedSampler
 import numpy as np
 import json
 import argparse
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset
 from tqdm import tqdm
 import string
 import os
@@ -97,7 +97,7 @@ def vectorize_context(context_words, w2v_model, ctx_len=10, embed_dim=300):
 
 # ---- Lazy Dataset ----
 
-class CharGenLazyDataset(Dataset):
+class CharGenStreamingDataset(IterableDataset):
     def __init__(self, data_dir, w2v_model, char_to_id, ctx_len=10, max_word_len=50, max_gen_len=50, num_workers=4):
         # Handle both single file and directory input
         if os.path.isfile(data_dir):
@@ -193,84 +193,44 @@ class CharGenLazyDataset(Dataset):
         # Fall back to sequential processing for now to avoid pickling issues
         return self._build_offsets_sequential()
 
-    def __len__(self):
-        if self.use_worker_files:
-            return self.total_samples
-        else:
-            return len(self.offsets)
-
-    def __getitem__(self, idx):
-        if self.use_worker_files:
-            # Streaming mode: ignore idx, read sequentially from worker's file
-            worker_info = torch.utils.data.get_worker_info()
-            if worker_info is not None:
-                # Use worker-specific file for streaming
-                file_idx = worker_info.id % len(self.file_paths)
-                file_path = self.file_paths[file_idx]
-                
-                # Initialize file iterator if not exists
-                if not hasattr(self, '_file_iterators'):
-                    self._file_iterators = {}
-                
-                if file_idx not in self._file_iterators:
-                    self._file_iterators[file_idx] = open(file_path, encoding="utf-8")
-                
-                # Read next line from the file
-                try:
-                    line = next(self._file_iterators[file_idx])
-                    sample = json.loads(line.strip())
-                except StopIteration:
-                    # Restart from beginning of file
-                    self._file_iterators[file_idx].close()
-                    self._file_iterators[file_idx] = open(file_path, encoding="utf-8")
-                    line = next(self._file_iterators[file_idx])
-                    sample = json.loads(line.strip())
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            # Each worker reads from its own file
+            worker_id = worker_info.id
+            if worker_id < len(self.file_paths):
+                file_path = self.file_paths[worker_id]
             else:
-                # Fallback for main process - use first file with seeking
-                file_path = self.file_paths[0]
-                # For main process, we'll still use some basic indexing
-                # This is a simplified fallback
-                with open(file_path, encoding="utf-8") as f:
-                    for i, line in enumerate(f):
-                        if i == idx % 1000:  # Simple modulo for main process
-                            sample = json.loads(line.strip())
-                            break
+                # More workers than files, cycle through
+                file_path = self.file_paths[worker_id % len(self.file_paths)]
+        else:
+            # Single process mode - use first file
+            file_path = self.file_paths[0]
+        
+        # Infinite streaming loop
+        while True:
+            with open(file_path, encoding="utf-8") as f:
+                for line in f:
+                    sample = json.loads(line.strip())
+                    context = pad_context(sample["context"], self.ctx_len)
+                    misspelled = sample["misspelled"]
+                    prefix = sample["generated_prefix"]
+                    next_char = sample["next_char"]
+                    context_vec = vectorize_context(context, self.w2v_model, self.ctx_len)
+                    misspelled_oh = one_hot_chars(misspelled, self.char_to_id, self.max_word_len)
+                    prefix_oh = one_hot_chars(prefix, self.char_to_id, self.max_gen_len)
+                    
+                    if next_char == "<eow>":
+                        next_id = self.char_to_id["<eow>"]
                     else:
-                        # If we don't find the line, use the first line
-                        f.seek(0)
-                        line = f.readline()
-                        sample = json.loads(line.strip())
-        else:
-            # Single file mode with indexing
-            with open(self.file_paths[0], encoding="utf-8") as f:
-                f.seek(self.offsets[idx])
-                line = f.readline()
-                sample = json.loads(line.strip())
-        context = pad_context(sample["context"], self.ctx_len)
-        misspelled = sample["misspelled"]
-        prefix = sample["generated_prefix"]
-        next_char = sample["next_char"]
-        context_vec = vectorize_context(context, self.w2v_model, self.ctx_len)
-        misspelled_oh = one_hot_chars(misspelled, self.char_to_id, self.max_word_len)
-        prefix_oh = one_hot_chars(prefix, self.char_to_id, self.max_gen_len)
-        # "<eow>" is used as end-of-word
-        if next_char == "<eow>":
-            next_id = self.char_to_id["<eow>"]
-        else:
-            next_id = self.char_to_id.get(next_char, 0)
-        return (
-            torch.tensor(context_vec, dtype=torch.float32),
-            torch.tensor(misspelled_oh, dtype=torch.float32),
-            torch.tensor(prefix_oh, dtype=torch.float32),
-            torch.tensor(next_id, dtype=torch.long)
-        )
-    
-    def __del__(self):
-        """Clean up file iterators when dataset is destroyed"""
-        if hasattr(self, '_file_iterators'):
-            for f in self._file_iterators.values():
-                if f and not f.closed:
-                    f.close()
+                        next_id = self.char_to_id.get(next_char, 0)
+                    
+                    yield (
+                        torch.tensor(context_vec, dtype=torch.float32),
+                        torch.tensor(misspelled_oh, dtype=torch.float32),
+                        torch.tensor(prefix_oh, dtype=torch.float32),
+                        torch.tensor(next_id, dtype=torch.long)
+                    )
 
 # ---- Model ----
 
@@ -304,7 +264,7 @@ class ResNetFFN(nn.Module):
 # ---- Training & Prediction ----
 
 def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocorrect.pt", 
-              local_rank=0, is_distributed=False, num_workers=4):
+              local_rank=0, is_distributed=False, num_workers=4, total_samples=None, batch_size=32):
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
     
@@ -334,7 +294,9 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
             
         # Use tqdm only on main process if distributed
         if not is_distributed or local_rank == 0:
-            loop = tqdm(dataloader, desc=f"Epoch {epoch+1}", unit="batch")
+            # Calculate total batches if we have total_samples
+            total_batches = total_samples // batch_size if total_samples else None
+            loop = tqdm(dataloader, desc=f"Epoch {epoch+1}", unit="batch", total=total_batches)
         else:
             loop = dataloader
             
@@ -746,7 +708,7 @@ if __name__ == "__main__":
 
         # Create dataset with parallel processing
         print(f"Creating dataset with {args.num_workers} workers for initialization...")
-        dataset = CharGenLazyDataset(
+        dataset = CharGenStreamingDataset(
             args.data_dir, 
             w2v_model, 
             char_to_id,
@@ -758,33 +720,29 @@ if __name__ == "__main__":
         
         # Setup data loading based on distributed mode
         if is_distributed:
-            # Use DistributedSampler for distributed training
-            sampler = DistributedSampler(dataset)
-            # Reduce workers per process for distributed training to avoid memory issues
+            # IterableDataset doesn't use samplers - data distribution is handled by workers reading different files
             workers_per_process = max(1, args.num_workers // max(1, torch.cuda.device_count()))
             dataloader = DataLoader(
                 dataset, 
                 batch_size=args.batch_size,
-                sampler=sampler,
                 num_workers=workers_per_process,
                 pin_memory=True,
                 persistent_workers=True if workers_per_process > 0 else False,
                 prefetch_factor=2,
                 drop_last=True  # Ensure consistent batch sizes across ranks
             )
-            print(f"Rank {local_rank}: Distributed DataLoader created with {len(dataset)} samples, {args.num_workers // max(1, torch.cuda.device_count())} workers per process")
+            print(f"Rank {local_rank}: Distributed streaming DataLoader created with {workers_per_process} workers per process")
         else:
             # Regular DataLoader for single GPU or DataParallel
             dataloader = DataLoader(
                 dataset, 
                 batch_size=args.batch_size, 
-                shuffle=True, 
                 num_workers=args.num_workers,
                 pin_memory=True,
                 persistent_workers=True,
                 prefetch_factor=2
             )
-            print(f"DataLoader created with {len(dataset)} samples, {args.num_workers} worker processes")
+            print(f"Streaming DataLoader created with {args.num_workers} worker processes")
         
         # Train the model (update is_distributed flag based on actual state)
         train_model(
@@ -795,7 +753,9 @@ if __name__ == "__main__":
             save_path=args.model,
             local_rank=local_rank if is_distributed else 0,
             is_distributed=is_distributed,
-            num_workers=args.num_workers
+            num_workers=args.num_workers,
+            total_samples=getattr(dataset, 'total_samples', None),
+            batch_size=args.batch_size
         )
     elif args.predict:
         # For prediction, we need to unwrap the model if it's wrapped in DataParallel or DDP
