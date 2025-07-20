@@ -14,6 +14,7 @@ import string
 import os
 import time
 import signal
+import torch.onnx
 from datetime import timedelta
 
 # Set up device
@@ -263,10 +264,67 @@ class ResNetFFN(nn.Module):
         logits = self.output_layer(x)
         return logits
 
+# ---- Model Format Detection ----
+
+def get_model_format(file_path):
+    """Determine model format based on file extension"""
+    if file_path.endswith('.pt') or file_path.endswith('.pth'):
+        return 'pytorch'
+    elif file_path.endswith('.onnx'):
+        return 'onnx'
+    else:
+        # Default to ONNX if no recognized extension
+        return 'onnx'
+
+def save_model(model, file_path, context_dim=None, word_onehot_dim=None, gen_onehot_dim=None, is_distributed=False):
+    """Save model in the format specified by file extension"""
+    format_type = get_model_format(file_path)
+    
+    # Get the actual model (unwrap DDP if needed)
+    actual_model = model.module if is_distributed else model
+    
+    if format_type == 'pytorch':
+        torch.save(actual_model.state_dict(), file_path)
+    elif format_type == 'onnx':
+        if context_dim is None or word_onehot_dim is None or gen_onehot_dim is None:
+            raise ValueError("ONNX export requires context_dim, word_onehot_dim, and gen_onehot_dim")
+        save_model_to_onnx(actual_model, file_path, 
+                          (1, context_dim), (1, word_onehot_dim), (1, gen_onehot_dim))
+
+# ---- ONNX Export ----
+
+def save_model_to_onnx(model, onnx_path, context_shape, misspelled_shape, prefix_shape):
+    """Save model to ONNX format"""
+    model.eval()
+    
+    # Create dummy inputs with the right shapes
+    dummy_context = torch.randn(1, context_shape[1]).to(next(model.parameters()).device)
+    dummy_misspelled = torch.randn(1, misspelled_shape[1]).to(next(model.parameters()).device)
+    dummy_prefix = torch.randn(1, prefix_shape[1]).to(next(model.parameters()).device)
+    
+    # Export to ONNX
+    torch.onnx.export(
+        model,
+        (dummy_context, dummy_misspelled, dummy_prefix),
+        onnx_path,
+        export_params=True,
+        opset_version=11,
+        do_constant_folding=True,
+        input_names=['context_vec', 'misspelled_oh', 'prefix_oh'],
+        output_names=['logits'],
+        dynamic_axes={
+            'context_vec': {0: 'batch_size'},
+            'misspelled_oh': {0: 'batch_size'},
+            'prefix_oh': {0: 'batch_size'},
+            'logits': {0: 'batch_size'}
+        }
+    )
+
 # ---- Training & Prediction ----
 
 def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocorrect.pt", 
-              local_rank=0, is_distributed=False, num_workers=4, total_samples=None, batch_size=32):
+              local_rank=0, is_distributed=False, num_workers=4, total_samples=None, batch_size=32,
+              context_dim=None, word_onehot_dim=None, gen_onehot_dim=None):
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
     
@@ -352,12 +410,9 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
                 # Check if save was requested (only save on main process)
                 if save_requested[0] and (not is_distributed or local_rank == 0):
                     print(f"\n💾 Saving model on demand...")
-                    if is_distributed:
-                        # Save the module without DDP wrapper
-                        torch.save(model.module.state_dict(), save_path)
-                    else:
-                        # Save regular model
-                        torch.save(model.state_dict(), save_path)
+                    
+                    save_model(model, save_path, context_dim, word_onehot_dim, gen_onehot_dim, is_distributed)
+                    
                     print(f"✅ Model saved to {save_path}")
                     save_requested[0] = False
                         
@@ -382,12 +437,9 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
             # Save model if it's the best so far
             if avg_loss < best_loss:
                 best_loss = avg_loss
-                if is_distributed:
-                    # Save the module without DDP wrapper
-                    torch.save(model.module.state_dict(), save_path)
-                else:
-                    torch.save(model.state_dict(), save_path)
-                print(f"New best model saved with loss: {best_loss:.4f}")
+                
+                save_model(model, save_path, context_dim, word_onehot_dim, gen_onehot_dim, is_distributed)
+                print(f"New best model saved with loss: {best_loss:.4f} → {save_path}")
             
         # Synchronize processes if distributed
         if is_distributed:
@@ -493,7 +545,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_gen_len", type=int, default=50)
     parser.add_argument("--ctx_len", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--model", type=str, default="char_autocorrect.pt")
+    parser.add_argument("--model", type=str, default="char_autocorrect.onnx")
     # Add model architecture arguments
     parser.add_argument("--hidden_dim", type=int, default=600, help="Hidden layer width")
     parser.add_argument("--num_layers", type=int, default=30, help="Number of hidden layers")
@@ -783,7 +835,10 @@ if __name__ == "__main__":
             is_distributed=is_distributed,
             num_workers=args.num_workers,
             total_samples=getattr(dataset, 'total_samples', None),
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            context_dim=context_dim,
+            word_onehot_dim=word_onehot_dim,
+            gen_onehot_dim=gen_onehot_dim
         )
     elif args.predict:
         # For prediction, we need to unwrap the model if it's wrapped in DataParallel or DDP
