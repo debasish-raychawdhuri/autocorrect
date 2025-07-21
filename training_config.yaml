@@ -1,0 +1,33 @@
+# Autocorrect Training Configuration
+# Use with: python run_reu.py --config training_config.yaml
+
+# Training mode
+train: true
+
+# Data settings
+data_dir: "training_data"
+word2vec: "word2vec_custom.pkl"
+
+# Model architecture
+hidden_dim: 1200
+num_layers: 50
+model: "autocorrect_large.onnx"
+
+# Training parameters
+epochs: 3
+batch_size: 16384
+ctx_len: 10
+max_word_len: 50
+max_gen_len: 50
+
+# Data loading
+num_workers: 8
+mp_start_method: "fork"
+
+# GPU settings
+multi_gpu: false
+distributed: false
+gpu: null  # Use default GPU
+
+# For prediction mode, set train: false and predict: true
+# predict: false

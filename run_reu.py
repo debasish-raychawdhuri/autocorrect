@@ -15,6 +15,7 @@ import os
 import time
 import signal
 import torch.onnx
+import yaml
 from datetime import timedelta
 
 # Set up device
@@ -531,35 +532,93 @@ def model_matches(model, state_dict):
 
 # ---- CLI ----
 
+def load_config(config_path):
+    """Load configuration from YAML file"""
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+def merge_config_args(config, args):
+    """Merge config file with command line args, giving priority to command line"""
+    # Start with config defaults
+    merged = config.copy() if config else {}
+    
+    # Override with command line args (only non-None values)
+    args_dict = vars(args)
+    for key, value in args_dict.items():
+        if value is not None:
+            merged[key] = value
+    
+    return merged
+
 if __name__ == "__main__":
     # Set multiprocessing start method
     import multiprocessing as mp
     
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, help="YAML config file path")
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--predict", action="store_true")
-    parser.add_argument("--data_dir", type=str, default="training_data", help="Directory containing training data files or single JSON file")
-    parser.add_argument("--word2vec", type=str, required=True, help="Custom word2vec file (.npz, .pkl, .json)")
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--max_word_len", type=int, default=50)
-    parser.add_argument("--max_gen_len", type=int, default=50)
-    parser.add_argument("--ctx_len", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--model", type=str, default="char_autocorrect.onnx")
+    parser.add_argument("--data_dir", type=str, help="Directory containing training data files or single JSON file")
+    parser.add_argument("--word2vec", type=str, help="Custom word2vec file (.npz, .pkl, .json)")
+    parser.add_argument("--epochs", type=int, help="Number of training epochs")
+    parser.add_argument("--max_word_len", type=int, help="Maximum word length")
+    parser.add_argument("--max_gen_len", type=int, help="Maximum generation length")
+    parser.add_argument("--ctx_len", type=int, help="Context length")
+    parser.add_argument("--batch_size", type=int, help="Batch size")
+    parser.add_argument("--model", type=str, help="Model file path")
     # Add model architecture arguments
-    parser.add_argument("--hidden_dim", type=int, default=600, help="Hidden layer width")
-    parser.add_argument("--num_layers", type=int, default=30, help="Number of hidden layers")
+    parser.add_argument("--hidden_dim", type=int, help="Hidden layer width")
+    parser.add_argument("--num_layers", type=int, help="Number of hidden layers")
     # Add multi-GPU arguments
     parser.add_argument("--multi_gpu", action="store_true", help="Use multiple GPUs with DataParallel")
     parser.add_argument("--distributed", action="store_true", help="Use DistributedDataParallel for multi-GPU training")
-    parser.add_argument("--local_rank", "--local-rank", type=int, default=-1, help="Local rank for distributed training")
-    parser.add_argument("--gpu", type=int, default=None, help="Specific GPU to use (if not using multi_gpu)")
+    parser.add_argument("--local_rank", "--local-rank", type=int, help="Local rank for distributed training")
+    parser.add_argument("--gpu", type=int, help="Specific GPU to use (if not using multi_gpu)")
     # Add CPU utilization arguments
-    parser.add_argument("--num_workers", type=int, default=None, 
-                        help="Number of worker processes for data loading (default: auto-detect based on CPU count)")
-    parser.add_argument("--mp_start_method", type=str, default='fork', choices=['fork', 'spawn', 'forkserver'],
+    parser.add_argument("--num_workers", type=int, help="Number of worker processes for data loading")
+    parser.add_argument("--mp_start_method", type=str, choices=['fork', 'spawn', 'forkserver'],
                         help="Multiprocessing start method")
-    args = parser.parse_args()
+    
+    cmd_args = parser.parse_args()
+    
+    # Load config file if specified
+    config = {}
+    if cmd_args.config:
+        config = load_config(cmd_args.config)
+        print(f"📄 Loaded config from: {cmd_args.config}")
+    
+    # Merge config with command line args
+    merged_config = merge_config_args(config, cmd_args)
+    
+    # Convert back to argparse Namespace with defaults
+    class Config:
+        def __init__(self, **kwargs):
+            # Set defaults
+            self.train = kwargs.get('train', False)
+            self.predict = kwargs.get('predict', False)
+            self.data_dir = kwargs.get('data_dir', 'training_data')
+            self.word2vec = kwargs.get('word2vec')
+            self.epochs = kwargs.get('epochs', 3)
+            self.max_word_len = kwargs.get('max_word_len', 50)
+            self.max_gen_len = kwargs.get('max_gen_len', 50)
+            self.ctx_len = kwargs.get('ctx_len', 10)
+            self.batch_size = kwargs.get('batch_size', 32)
+            self.model = kwargs.get('model', 'char_autocorrect.onnx')
+            self.hidden_dim = kwargs.get('hidden_dim', 600)
+            self.num_layers = kwargs.get('num_layers', 30)
+            self.multi_gpu = kwargs.get('multi_gpu', False)
+            self.distributed = kwargs.get('distributed', False)
+            self.local_rank = kwargs.get('local_rank', -1)
+            self.gpu = kwargs.get('gpu')
+            self.num_workers = kwargs.get('num_workers')
+            self.mp_start_method = kwargs.get('mp_start_method', 'fork')
+    
+    args = Config(**merged_config)
+    
+    # Validate required args
+    if not args.word2vec:
+        print("Error: --word2vec is required (or specify in config file)")
+        exit(1)
 
     # Setup for distributed training if enabled
     is_distributed = args.distributed
