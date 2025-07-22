@@ -8,7 +8,7 @@
 infile: "sentences.txt"
 outdir: "training_data"
 multi_files: true
-dataloader_workers: 8  # Number of output files to create
+dataloader_workers: 32  # Number of output files to create
 n_noisy: 10  # Number of misspelled versions per word
 workers: null  # Generation processes (null = auto-detect CPU cores)
 
@@ -19,8 +19,8 @@ data_dir: "training_data"  # Should match outdir above
 word2vec: "word2vec_custom.pkl"
 
 # Model architecture
-hidden_dim: 1200
-num_layers: 50
+hidden_dim: 900
+num_layers: 30
 model: "autocorrect_large.onnx"
 
 # Training hyperparameters
