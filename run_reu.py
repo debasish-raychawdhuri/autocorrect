@@ -627,6 +627,36 @@ if __name__ == "__main__":
     
     args = Config(**merged_config)
     
+    # Print all configuration options for user confirmation
+    print("\n" + "=" * 60)
+    print("TRAINING CONFIGURATION")
+    print("=" * 60)
+    print(f"Mode: {'Training' if args.train else 'Prediction' if args.predict else 'Unknown'}")
+    print(f"Data directory: {args.data_dir}")
+    print(f"Word2Vec file: {args.word2vec}")
+    print(f"Model file: {args.model}")
+    print(f"Epochs: {args.epochs}")
+    print(f"Context length: {args.ctx_len}")
+    print(f"Max word length: {args.max_word_len}")
+    print(f"Max generation length: {args.max_gen_len}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Hidden dimensions: {args.hidden_dim}")
+    print(f"Number of layers: {args.num_layers}")
+    print(f"Multi-GPU: {args.multi_gpu}")
+    print(f"Distributed: {args.distributed}")
+    print(f"GPU: {args.gpu}")
+    if args.num_workers:
+        print(f"Data loading workers: {args.num_workers}")
+    print(f"Multiprocessing method: {args.mp_start_method}")
+    print("=" * 60)
+    
+    # Get user confirmation
+    response = input("Proceed with training? (y/N): ").strip().lower()
+    if response not in ['y', 'yes']:
+        print("Training cancelled.")
+        exit(0)
+    print()
+
     # Validate required args
     if not args.word2vec:
         print("Error: --word2vec is required (or specify in config file)")
