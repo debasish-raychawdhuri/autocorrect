@@ -1431,6 +1431,17 @@ if __name__ == "__main__":
                         else:
                             print(f"Successfully extracted {len(checkpoint)} parameters from ONNX model")
                             
+                            # Check for NaN/inf values in loaded weights
+                            nan_params = []
+                            for name, param in checkpoint.items():
+                                if torch.isnan(param).any() or torch.isinf(param).any():
+                                    nan_params.append(name)
+                            
+                            if nan_params:
+                                print(f"WARNING: Found NaN/inf values in parameters: {nan_params}")
+                                print("This will cause training to fail. Starting from scratch instead...")
+                                should_resume = False
+                            
                     except ImportError as e:
                         print(f"Missing required library for ONNX loading: {e}")
                         print("Please install: pip install onnx onnxruntime")
