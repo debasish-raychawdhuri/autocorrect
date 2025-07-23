@@ -310,40 +310,40 @@ class CharGenStreamingDataset(IterableDataset):
         
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is not None:
-            # Each worker reads from its own file
+            # Each worker processes multiple files assigned to it
             worker_id = worker_info.id
-            if worker_id < len(self.file_paths):
-                file_path = self.file_paths[worker_id]
-            else:
-                # More workers than files, cycle through
-                file_path = self.file_paths[worker_id % len(self.file_paths)]
+            num_workers = worker_info.num_workers
+            # Assign files to workers in round-robin fashion
+            worker_files = [self.file_paths[i] for i in range(len(self.file_paths)) if i % num_workers == worker_id]
         else:
-            # Single process mode - use first file
-            file_path = self.file_paths[0]
+            # Single process mode - use all files
+            worker_files = self.file_paths
         
-        # Open file ONCE and read through it exactly once per epoch
-        with open(file_path, encoding="utf-8", buffering=8*1024*1024) as f:  # 8MB buffer
-            for line in f:
-                sample = json.loads(line.strip())
-                context = pad_context(sample["context"], self.ctx_len)
-                misspelled = sample["misspelled"]
-                prefix = sample["generated_prefix"]
-                next_char = sample["next_char"]
-                context_vec = vectorize_context(context, w2v_model, self.ctx_len)
-                misspelled_oh = one_hot_chars(misspelled, self.char_to_id, self.max_word_len)
-                prefix_oh = one_hot_chars(prefix, self.char_to_id, self.max_gen_len)
-                
-                if next_char == "<eow>":
-                    next_id = self.char_to_id["<eow>"]
-                else:
-                    next_id = self.char_to_id.get(next_char, 0)
-                
-                yield (
-                    torch.tensor(context_vec, dtype=torch.float32),
-                    torch.tensor(misspelled_oh, dtype=torch.float32),
-                    torch.tensor(prefix_oh, dtype=torch.float32),
-                    torch.tensor(next_id, dtype=torch.long)
-                )
+        # Process all files assigned to this worker
+        for file_path in worker_files:
+            # Open file ONCE and read through it exactly once per epoch
+            with open(file_path, encoding="utf-8", buffering=8*1024*1024) as f:  # 8MB buffer
+                for line in f:
+                    sample = json.loads(line.strip())
+                    context = pad_context(sample["context"], self.ctx_len)
+                    misspelled = sample["misspelled"]
+                    prefix = sample["generated_prefix"]
+                    next_char = sample["next_char"]
+                    context_vec = vectorize_context(context, w2v_model, self.ctx_len)
+                    misspelled_oh = one_hot_chars(misspelled, self.char_to_id, self.max_word_len)
+                    prefix_oh = one_hot_chars(prefix, self.char_to_id, self.max_gen_len)
+                    
+                    if next_char == "<eow>":
+                        next_id = self.char_to_id["<eow>"]
+                    else:
+                        next_id = self.char_to_id.get(next_char, 0)
+                    
+                    yield (
+                        torch.tensor(context_vec, dtype=torch.float32),
+                        torch.tensor(misspelled_oh, dtype=torch.float32),
+                        torch.tensor(prefix_oh, dtype=torch.float32),
+                        torch.tensor(next_id, dtype=torch.long)
+                    )
 
 # ---- Model ----
 
