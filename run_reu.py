@@ -17,6 +17,95 @@ import signal
 import torch.onnx
 import yaml
 from datetime import timedelta
+from multiprocessing import shared_memory
+import pickle
+
+# Global shared memory for word2vec
+_shared_w2v_memory = None
+_shared_w2v_metadata = None
+
+class SharedWord2Vec:
+    """Wrapper for word2vec model in shared memory"""
+    
+    def __init__(self, shm_name, metadata):
+        self.shm_name = shm_name
+        self.metadata = metadata
+        self.vector_size = metadata['vector_size']
+        self.vocab_size = metadata['vocab_size']
+        self.word_to_index = metadata['word_to_index']
+        
+        # Attach to existing shared memory
+        self.shm = shared_memory.SharedMemory(name=shm_name)
+        self.vectors = np.ndarray(
+            (self.vocab_size, self.vector_size), 
+            dtype=np.float32, 
+            buffer=self.shm.buf
+        )
+    
+    def __contains__(self, word):
+        return word in self.word_to_index
+    
+    def __getitem__(self, word):
+        if word not in self.word_to_index:
+            raise KeyError(f"Word '{word}' not in vocabulary")
+        idx = self.word_to_index[word]
+        return self.vectors[idx]
+
+def create_shared_word2vec(w2v_model):
+    """Create shared memory version of word2vec model"""
+    global _shared_w2v_memory, _shared_w2v_metadata
+    
+    print("Creating shared memory for word2vec model...")
+    
+    # Extract words and vectors
+    words = list(w2v_model.word_vectors.keys())
+    vectors = np.array([w2v_model.word_vectors[word] for word in words], dtype=np.float32)
+    
+    vocab_size, vector_size = vectors.shape
+    
+    # Create shared memory
+    shm_size = vectors.nbytes
+    shm = shared_memory.SharedMemory(create=True, size=shm_size)
+    
+    # Copy vectors to shared memory
+    shared_vectors = np.ndarray(vectors.shape, dtype=np.float32, buffer=shm.buf)
+    shared_vectors[:] = vectors[:]
+    
+    # Create metadata
+    metadata = {
+        'vector_size': vector_size,
+        'vocab_size': vocab_size,
+        'word_to_index': {word: i for i, word in enumerate(words)}
+    }
+    
+    _shared_w2v_memory = shm
+    _shared_w2v_metadata = metadata
+    
+    print(f"Created shared memory: {shm_size / 1024 / 1024:.1f} MB for {vocab_size} words")
+    
+    return SharedWord2Vec(shm.name, metadata)
+
+def get_shared_word2vec():
+    """Get shared word2vec instance for worker processes"""
+    global _shared_w2v_metadata
+    if _shared_w2v_metadata is None:
+        raise RuntimeError("Shared word2vec not initialized")
+    
+    # Get shared memory name from environment or global
+    shm_name = os.environ.get('SHARED_W2V_NAME')
+    if shm_name is None:
+        raise RuntimeError("Shared word2vec name not found")
+    
+    return SharedWord2Vec(shm_name, _shared_w2v_metadata)
+
+def cleanup_shared_word2vec():
+    """Cleanup shared memory"""
+    global _shared_w2v_memory
+    if _shared_w2v_memory is not None:
+        _shared_w2v_memory.close()
+        _shared_w2v_memory.unlink()
+        _shared_w2v_memory = None
+        print("Shared word2vec memory cleaned up")
 
 # Set up device
 def setup_device(gpu_id=None, use_multi_gpu=False):
@@ -106,7 +195,7 @@ def vectorize_context(context_words, w2v_model, ctx_len=10, embed_dim=300):
 # ---- Lazy Dataset ----
 
 class CharGenStreamingDataset(IterableDataset):
-    def __init__(self, data_dir, w2v_model, char_to_id, ctx_len=10, max_word_len=50, max_gen_len=50, num_workers=4):
+    def __init__(self, data_dir, w2v_model, char_to_id, ctx_len=10, max_word_len=50, max_gen_len=50, num_workers=4, use_shared_memory=False):
         # Handle both single file and directory input
         if os.path.isfile(data_dir):
             # Single file mode (backward compatibility)
@@ -128,6 +217,15 @@ class CharGenStreamingDataset(IterableDataset):
         self.max_word_len = max_word_len
         self.max_gen_len = max_gen_len
         self.num_workers = num_workers
+        self.use_shared_memory = use_shared_memory
+        
+        # Store shared memory metadata for workers
+        if use_shared_memory and hasattr(w2v_model, 'shm_name'):
+            self.shm_name = w2v_model.shm_name
+            self.w2v_metadata = w2v_model.metadata
+        else:
+            self.shm_name = None
+            self.w2v_metadata = None
 
         # For streaming mode, read exact sample counts from metadata
         if self.use_worker_files:
@@ -202,6 +300,14 @@ class CharGenStreamingDataset(IterableDataset):
         return self._build_offsets_sequential()
 
     def __iter__(self):
+        # Get worker-specific word2vec model
+        if self.use_shared_memory and self.shm_name:
+            # Worker process - attach to shared memory
+            w2v_model = SharedWord2Vec(self.shm_name, self.w2v_metadata)
+        else:
+            # Use the original model
+            w2v_model = self.w2v_model
+        
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is not None:
             # Each worker reads from its own file
@@ -223,7 +329,7 @@ class CharGenStreamingDataset(IterableDataset):
                 misspelled = sample["misspelled"]
                 prefix = sample["generated_prefix"]
                 next_char = sample["next_char"]
-                context_vec = vectorize_context(context, self.w2v_model, self.ctx_len)
+                context_vec = vectorize_context(context, w2v_model, self.ctx_len)
                 misspelled_oh = one_hot_chars(misspelled, self.char_to_id, self.max_word_len)
                 prefix_oh = one_hot_chars(prefix, self.char_to_id, self.max_gen_len)
                 
@@ -754,7 +860,22 @@ if __name__ == "__main__":
         device, num_gpus = setup_device(args.gpu, args.multi_gpu)
 
     from custom_word2vec import load_custom_word2vec
-    w2v_model = load_custom_word2vec(args.word2vec)
+    
+    # Load word2vec and create shared memory version for workers
+    print("Loading word2vec model...")
+    original_w2v_model = load_custom_word2vec(args.word2vec)
+    
+    # Create shared memory version for DataLoader workers
+    if args.num_workers > 0:
+        w2v_model = create_shared_word2vec(original_w2v_model)
+        use_shared_memory = True
+        
+        # Set environment variable for workers to find shared memory
+        os.environ['SHARED_W2V_NAME'] = w2v_model.shm_name
+        print(f"Created shared memory word2vec: {w2v_model.shm_name}")
+    else:
+        w2v_model = original_w2v_model
+        use_shared_memory = False
     char_to_id, id_to_char = create_charmap()
     char_vocab_size = len(char_to_id)
 
@@ -896,7 +1017,8 @@ if __name__ == "__main__":
             ctx_len=args.ctx_len, 
             max_word_len=args.max_word_len, 
             max_gen_len=args.max_gen_len,
-            num_workers=args.num_workers
+            num_workers=args.num_workers,
+            use_shared_memory=use_shared_memory
         )
         
         # Setup data loading based on distributed mode
@@ -941,6 +1063,11 @@ if __name__ == "__main__":
             word_onehot_dim=word_onehot_dim,
             gen_onehot_dim=gen_onehot_dim
         )
+        
+        # Cleanup shared memory after training
+        if use_shared_memory:
+            cleanup_shared_word2vec()
+        
     elif args.predict:
         # For prediction, we need to unwrap the model if it's wrapped in DataParallel or DDP
         if isinstance(model, (nn.DataParallel, DDP)):
@@ -970,3 +1097,7 @@ if __name__ == "__main__":
                     print(f"{i:2d}. {word} (log_prob: {log_prob:.3f})")
         except KeyboardInterrupt:
             print("\nExiting...")
+        
+        # Cleanup shared memory on exit
+        if use_shared_memory:
+            cleanup_shared_word2vec()
