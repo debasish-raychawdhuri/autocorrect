@@ -993,6 +993,9 @@ if __name__ == "__main__":
                         checkpoint = {}
                         
                         # Get ONNX initializers (weights and biases)
+                        print(f"ONNX file contains {len(onnx_model.graph.initializer)} initializers")
+                        print(f"Current model has {len(current_state_dict)} parameters")
+                        
                         for initializer in onnx_model.graph.initializer:
                             param_name = initializer.name
                             param_data = onnx.numpy_helper.to_array(initializer)
@@ -1006,6 +1009,8 @@ if __name__ == "__main__":
                                     if param_name.endswith(pytorch_name) or pytorch_name.endswith(param_name):
                                         checkpoint[pytorch_name] = torch.from_numpy(param_data.copy())
                                         break
+                                else:
+                                    print(f"ONNX parameter '{param_name}' not matched to any model parameter")
                         
                         # Strict parameter matching - must have exact same parameters
                         if len(checkpoint) != len(current_state_dict):
