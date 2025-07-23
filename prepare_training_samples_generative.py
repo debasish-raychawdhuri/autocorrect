@@ -62,12 +62,27 @@ def generate_samples_for_sentence(sentence, ctx_len=10, n_noisy=10, alphabet=Non
                 })
     return results
 
-def worker(args):
-    chunk, ctx_len, n_noisy, alphabet = args
-    batch = []
-    for sentence in chunk:
-        batch.extend(generate_samples_for_sentence(sentence, ctx_len, n_noisy, alphabet))
-    return batch
+def file_worker(args):
+    output_file, ctx_len, n_noisy, alphabet, sentence_queue = args
+    import json
+    sample_count = 0
+    
+    with open(output_file, "w", encoding="utf-8", buffering=1) as f:
+        while True:
+            try:
+                sentence = sentence_queue.get(timeout=1)
+                if sentence is None:  # Poison pill to stop worker
+                    break
+                
+                samples = generate_samples_for_sentence(sentence, ctx_len, n_noisy, alphabet)
+                for sample in samples:
+                    f.write(json.dumps(sample) + "\n")
+                    sample_count += 1
+                    
+            except:  # Queue timeout or other error
+                break
+    
+    return sample_count
 
 def process_sentences_parallel(in_file, out_file, ctx_len=10, n_noisy=10, num_workers=None, batch_size=1000):
     # Count total sentences for progress tracking using wc -l
@@ -127,6 +142,7 @@ def process_sentences_to_multiple_files(in_file, out_dir, num_files=8, ctx_len=1
     """Process sentences and distribute output across multiple files"""
     import os
     import subprocess
+    import multiprocessing as mp
     
     # Create output directory
     os.makedirs(out_dir, exist_ok=True)
@@ -135,102 +151,87 @@ def process_sentences_to_multiple_files(in_file, out_dir, num_files=8, ctx_len=1
     result = subprocess.run(['wc', '-l', in_file], capture_output=True, text=True)
     total_sentences = int(result.stdout.split()[0])
     
-    num_workers = num_workers or multiprocessing.cpu_count()
+    # Use num_files as number of workers (one worker per output file)
+    num_workers = num_files
     alphabet = "abcdefghijklmnopqrstuvwxyz'"
     
-    # Open multiple output files
+    # Prepare output file paths
     output_files = []
-    file_handles = []
     for i in range(num_files):
         filename = os.path.join(out_dir, f"training_data_{i:03d}.json")
         output_files.append(filename)
-        file_handles.append(open(filename, "w", encoding="utf-8", buffering=1))
+    
+    # Create a queue for distributing sentences to workers
+    sentence_queue = mp.Queue(maxsize=1000)
+    
+    # Start worker processes
+    processes = []
+    for i in range(num_workers):
+        args = (output_files[i], ctx_len, n_noisy, alphabet, sentence_queue)
+        p = mp.Process(target=file_worker, args=(args,))
+        p.start()
+        processes.append(p)
     
     try:
-        current_file_idx = 0
-        sample_counts = [0] * num_files
-        
+        # Read sentences and distribute to workers
         with open(in_file, encoding="utf-8") as fin:
-            sentences_batch = []
-            processed_sentences = 0
-            
             with tqdm(total=total_sentences, desc="Processing sentences") as pbar:
                 for line in fin:
                     sentence = line.strip()
                     if sentence:
-                        sentences_batch.append(sentence)
-                        
-                        # Process batch when it reaches batch_size
-                        if len(sentences_batch) >= batch_size:
-                            # Create chunks for multiprocessing
-                            chunk_size = math.ceil(len(sentences_batch) / num_workers)
-                            chunks = [sentences_batch[i:i+chunk_size] for i in range(0, len(sentences_batch), chunk_size)]
-                            args_list = [(chunk, ctx_len, n_noisy, alphabet) for chunk in chunks]
-                            
-                            # Process in parallel and distribute across files
-                            with multiprocessing.Pool(processes=num_workers) as pool:
-                                all_results = pool.map(worker, args_list)
-                                for batch_results in all_results:
-                                    for sample in batch_results:
-                                        file_handles[current_file_idx].write(json.dumps(sample) + "\n")
-                                        sample_counts[current_file_idx] += 1
-                                        current_file_idx = (current_file_idx + 1) % num_files
-                            
-                            processed_sentences += len(sentences_batch)
-                            pbar.update(len(sentences_batch))
-                            sentences_batch = []  # Clear batch from memory
-                
-                # Process remaining sentences
-                if sentences_batch:
-                    chunk_size = math.ceil(len(sentences_batch) / num_workers)
-                    chunks = [sentences_batch[i:i+chunk_size] for i in range(0, len(sentences_batch), chunk_size)]
-                    args_list = [(chunk, ctx_len, n_noisy, alphabet) for chunk in chunks]
-                    
-                    with multiprocessing.Pool(processes=num_workers) as pool:
-                        all_results = pool.map(worker, args_list)
-                        for batch_results in all_results:
-                            for sample in batch_results:
-                                file_handles[current_file_idx].write(json.dumps(sample) + "\n")
-                                sample_counts[current_file_idx] += 1
-                                current_file_idx = (current_file_idx + 1) % num_files
-                    
-                    processed_sentences += len(sentences_batch)
-                    pbar.update(len(sentences_batch))
-    
+                        sentence_queue.put(sentence)
+                        pbar.update(1)
+        
+        # Send poison pills to stop workers
+        for _ in range(num_workers):
+            sentence_queue.put(None)
+        
+        # Wait for all processes to complete
+        sample_counts = []
+        for p in processes:
+            p.join()
+            # Note: Can't easily get return values from Process, will calculate later
+        
     finally:
-        # Flush and close all file handles
-        for fh in file_handles:
-            fh.flush()
-        for fh in file_handles:
-            fh.close()
+        # Cleanup any remaining processes
+        for p in processes:
+            if p.is_alive():
+                p.terminate()
+                p.join()
         
         # Ensure all data is synced to disk
-        import os
         os.sync()
     
-    # Print summary and create metadata
-    total_samples = sum(sample_counts)
+    # Print summary and create metadata (calculate from actual files)
+    total_samples = 0
     total_size = 0
     metadata = {
-        "total_samples": total_samples,
+        "total_samples": 0,
         "total_files": num_files,
         "files": []
     }
     
     print(f"\nOutput files created in {out_dir}:")
-    for i, (filename, count) in enumerate(zip(output_files, sample_counts)):
-        size = os.path.getsize(filename)
-        total_size += size
-        
-        # Add to metadata
-        metadata["files"].append({
-            "filename": f"training_data_{i:03d}.json",
-            "samples": count,
-            "size_bytes": size
-        })
-        
-        print(f"  training_data_{i:03d}.json: {count:,} samples, {size / (1024**2):.1f} MB")
+    for i, filename in enumerate(output_files):
+        if os.path.exists(filename):
+            size = os.path.getsize(filename)
+            total_size += size
+            
+            # Count samples by counting lines
+            with open(filename, 'r') as f:
+                count = sum(1 for line in f if line.strip())
+            total_samples += count
+            
+            # Add to metadata
+            metadata["files"].append({
+                "filename": f"training_data_{i:03d}.json",
+                "samples": count,
+                "size_bytes": size
+            })
+            
+            print(f"  training_data_{i:03d}.json: {count:,} samples, {size / (1024**2):.1f} MB")
     
+    metadata["total_samples"] = total_samples
     metadata["total_size_bytes"] = total_size
     
     # Save metadata file
