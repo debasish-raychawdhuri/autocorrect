@@ -89,6 +89,12 @@ class SharedBatchBuffer:
                 buffer=target_shm.buf
             )
             
+            # Initialize arrays to zero (shared memory contains random garbage)
+            context_array.fill(0.0)
+            word_onehot_array.fill(0.0)
+            gen_onehot_array.fill(0.0)
+            target_array.fill(0)
+            
             self.buffers.append({
                 'context_shm': context_shm,
                 'word_onehot_shm': word_onehot_shm,
@@ -266,6 +272,144 @@ def cleanup_shared_batch_buffers():
         _shared_batch_buffers.cleanup()
         _shared_batch_buffers = None
         print("Shared batch buffers cleaned up")
+
+class QueueDataLoader:
+    """Simple DataLoader using multiprocessing Queue"""
+    
+    def __init__(self, dataset, batch_size, num_workers, batch_queue):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.batch_queue = batch_queue
+        
+        # Start worker processes 
+        self.workers = []
+        self.stop_event = mp.Event()
+        
+        # Distribute dataset files among workers
+        if hasattr(dataset, 'file_paths'):
+            files_per_worker = len(dataset.file_paths) // num_workers
+            remaining_files = len(dataset.file_paths) % num_workers
+            
+            file_start = 0
+            for worker_id in range(num_workers):
+                # Calculate files for this worker
+                files_for_worker = files_per_worker + (1 if worker_id < remaining_files else 0)
+                worker_files = dataset.file_paths[file_start:file_start + files_for_worker]
+                file_start += files_for_worker
+                
+                # Start worker process
+                worker = mp.Process(
+                    target=self._worker_process,
+                    args=(worker_id, worker_files, dataset, batch_size, batch_queue, self.stop_event)
+                )
+                worker.daemon = True
+                worker.start()
+                self.workers.append(worker)
+        
+        print(f"Started {len(self.workers)} worker processes for queue-based data loading")
+    
+    def _worker_process(self, worker_id, file_paths, dataset, batch_size, batch_queue, stop_event):
+        """Worker process that puts batches in queue"""
+        try:
+            # Get worker-specific word2vec model
+            if dataset.use_shared_memory and dataset.shm_name:
+                w2v_model = SharedWord2Vec(dataset.shm_name, dataset.w2v_metadata)
+            else:
+                w2v_model = dataset.w2v_model
+            
+            # Generate batches and put in queue
+            while not stop_event.is_set():
+                for file_path in file_paths:
+                    if stop_event.is_set():
+                        break
+                    
+                    with open(file_path, encoding="utf-8", buffering=8*1024*1024) as f:
+                        batch_samples = []
+                        
+                        for line in f:
+                            if stop_event.is_set():
+                                break
+                            
+                            sample = json.loads(line.strip())
+                            context = pad_context(sample["context"], dataset.ctx_len)
+                            misspelled = sample["misspelled"]
+                            prefix = sample["generated_prefix"]
+                            next_char = sample["next_char"]
+                            
+                            context_vec = vectorize_context(context, w2v_model, dataset.ctx_len)
+                            misspelled_oh = one_hot_chars(misspelled, dataset.char_to_id, dataset.max_word_len)
+                            prefix_oh = one_hot_chars(prefix, dataset.char_to_id, dataset.max_gen_len)
+                            
+                            if next_char == "<eow>":
+                                next_id = dataset.char_to_id["<eow>"]
+                            else:
+                                next_id = dataset.char_to_id.get(next_char, 0)
+                            
+                            batch_samples.append((context_vec, misspelled_oh, prefix_oh, next_id))
+                            
+                            # When we have a full batch, put in queue
+                            if len(batch_samples) == batch_size:
+                                self._put_batch_in_queue(batch_samples, batch_queue, stop_event)
+                                batch_samples = []
+                        
+                        # Handle remaining samples
+                        if batch_samples and not stop_event.is_set():
+                            self._put_batch_in_queue(batch_samples, batch_queue, stop_event)
+            
+        except Exception as e:
+            print(f"Worker {worker_id} error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _put_batch_in_queue(self, batch_samples, batch_queue, stop_event):
+        """Convert batch to tensors and put in queue"""
+        if stop_event.is_set():
+            return
+            
+        # Convert to tensors 
+        context_tensors = []
+        word_onehot_tensors = []
+        gen_onehot_tensors = []
+        target_tensors = []
+        
+        for context_vec, misspelled_oh, prefix_oh, next_id in batch_samples:
+            context_tensors.append(torch.tensor(context_vec, dtype=torch.float32))
+            word_onehot_tensors.append(torch.tensor(misspelled_oh, dtype=torch.float32))
+            gen_onehot_tensors.append(torch.tensor(prefix_oh, dtype=torch.float32))
+            target_tensors.append(torch.tensor(next_id, dtype=torch.long))
+        
+        # Stack into batch tensors
+        batch_context = torch.stack(context_tensors)
+        batch_word_onehot = torch.stack(word_onehot_tensors) 
+        batch_gen_onehot = torch.stack(gen_onehot_tensors)
+        batch_target = torch.stack(target_tensors)
+        
+        # Put batch in queue
+        try:
+            batch_queue.put((batch_context, batch_word_onehot, batch_gen_onehot, batch_target), timeout=1.0)
+        except:
+            pass  # Queue full or timeout, skip this batch
+    
+    def __iter__(self):
+        """Iterator that gets batches from queue"""
+        while True:
+            try:
+                batch = self.batch_queue.get(timeout=10.0)
+                if batch is None:  # Sentinel to stop
+                    break
+                yield batch
+            except:
+                # Timeout or other error
+                break
+    
+    def stop(self):
+        """Stop all worker processes"""
+        self.stop_event.set()
+        for worker in self.workers:
+            worker.join(timeout=2.0)
+            if worker.is_alive():
+                worker.terminate()
 
 class SharedMemoryDataLoader:
     """Custom DataLoader that uses shared memory batches"""
@@ -1516,28 +1660,21 @@ if __name__ == "__main__":
             use_shared_memory=use_shared_memory
         )
         
-        # Create shared memory batch buffers for high-performance data loading
+        # Use multiprocessing Queue for simple, reliable data passing
         if args.num_workers > 0:
-            # Calculate number of buffers - enough to keep GPU busy while workers fill new ones
-            num_buffers = min(20, args.num_workers * 2)  # 2 buffers per worker, max 20
+            from multiprocessing import Queue
             
-            print(f"Creating shared memory batch buffer system...")
-            batch_buffer_system = create_shared_batch_buffers(
-                num_buffers=num_buffers,
-                batch_size=args.batch_size,
-                context_dim=context_dim,
-                word_onehot_dim=word_onehot_dim,
-                gen_onehot_dim=gen_onehot_dim
-            )
+            # Create batch queue
+            batch_queue = Queue(maxsize=50)  # Buffer up to 50 batches
             
-            # Use custom shared memory DataLoader
-            dataloader = SharedMemoryDataLoader(
+            # Use queue-based DataLoader
+            dataloader = QueueDataLoader(
                 dataset=dataset,
                 batch_size=args.batch_size,
                 num_workers=args.num_workers,
-                batch_buffer_system=batch_buffer_system
+                batch_queue=batch_queue
             )
-            print(f"Created shared memory DataLoader with {args.num_workers} workers and {num_buffers} buffers")
+            print(f"Created queue-based DataLoader with {args.num_workers} workers")
         else:
             # Fallback to regular DataLoader for single-process mode
             dataloader = DataLoader(
@@ -1569,10 +1706,9 @@ if __name__ == "__main__":
         if use_shared_memory:
             cleanup_shared_word2vec()
         
-        # Cleanup shared batch buffers
+        # Cleanup queue-based dataloader
         if args.num_workers > 0 and hasattr(dataloader, 'stop'):
             dataloader.stop()
-            cleanup_shared_batch_buffers()
         
     elif args.predict:
         # For prediction, we need to unwrap the model if it's wrapped in DataParallel or DDP
