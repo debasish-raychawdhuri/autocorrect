@@ -198,9 +198,15 @@ def process_sentences_to_multiple_files(in_file, out_dir, num_files=8, ctx_len=1
                     pbar.update(len(sentences_batch))
     
     finally:
-        # Close all file handles
+        # Flush and close all file handles
+        for fh in file_handles:
+            fh.flush()
         for fh in file_handles:
             fh.close()
+        
+        # Ensure all data is synced to disk
+        import os
+        os.sync()
     
     # Print summary and create metadata
     total_samples = sum(sample_counts)
