@@ -405,6 +405,16 @@ class SharedMemoryDataLoader:
                     gen_onehot_tensor = torch.from_numpy(buffer['gen_onehot_array'][:actual_batch_size].copy())
                     target_tensor = torch.from_numpy(buffer['target_array'][:actual_batch_size].copy())
                 
+                # Check for NaN values in tensors before yielding
+                if torch.isnan(context_tensor).any():
+                    print(f"ERROR: NaN values in context_tensor from shared memory")
+                if torch.isnan(word_onehot_tensor).any():
+                    print(f"ERROR: NaN values in word_onehot_tensor from shared memory")
+                if torch.isnan(gen_onehot_tensor).any():
+                    print(f"ERROR: NaN values in gen_onehot_tensor from shared memory")
+                if torch.isnan(target_tensor).any():
+                    print(f"ERROR: NaN values in target_tensor from shared memory")
+                
                 # Mark buffer as consumed
                 self.batch_buffer_system.mark_buffer_consumed(buffer_idx)
                 
