@@ -144,7 +144,7 @@ def process_sentences_to_multiple_files(in_file, out_dir, num_files=8, ctx_len=1
     for i in range(num_files):
         filename = os.path.join(out_dir, f"training_data_{i:03d}.json")
         output_files.append(filename)
-        file_handles.append(open(filename, "w", encoding="utf-8"))
+        file_handles.append(open(filename, "w", encoding="utf-8", buffering=1))
     
     try:
         current_file_idx = 0
