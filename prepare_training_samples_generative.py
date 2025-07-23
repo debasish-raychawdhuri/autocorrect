@@ -63,7 +63,7 @@ def generate_samples_for_sentence(sentence, ctx_len=10, n_noisy=10, alphabet=Non
     return results
 
 def file_worker(args):
-    output_file, ctx_len, n_noisy, alphabet, sentence_queue = args
+    output_file, ctx_len, n_noisy, alphabet, sentence_queue, result_queue = args
     import json
     sample_count = 0
     
@@ -82,6 +82,8 @@ def file_worker(args):
             except:  # Queue timeout or other error
                 break
     
+    # Send result back to main process
+    result_queue.put((output_file, sample_count))
     return sample_count
 
 def process_sentences_parallel(in_file, out_file, ctx_len=10, n_noisy=10, num_workers=None, batch_size=1000):
@@ -161,13 +163,14 @@ def process_sentences_to_multiple_files(in_file, out_dir, num_files=8, ctx_len=1
         filename = os.path.join(out_dir, f"training_data_{i:03d}.json")
         output_files.append(filename)
     
-    # Create a queue for distributing sentences to workers
+    # Create queues for distributing sentences and collecting results
     sentence_queue = mp.Queue(maxsize=1000)
+    result_queue = mp.Queue()
     
     # Start worker processes
     processes = []
     for i in range(num_workers):
-        args = (output_files[i], ctx_len, n_noisy, alphabet, sentence_queue)
+        args = (output_files[i], ctx_len, n_noisy, alphabet, sentence_queue, result_queue)
         p = mp.Process(target=file_worker, args=(args,))
         p.start()
         processes.append(p)
@@ -186,11 +189,15 @@ def process_sentences_to_multiple_files(in_file, out_dir, num_files=8, ctx_len=1
         for _ in range(num_workers):
             sentence_queue.put(None)
         
-        # Wait for all processes to complete
-        sample_counts = []
+        # Wait for all processes to complete and collect results
         for p in processes:
             p.join()
-            # Note: Can't easily get return values from Process, will calculate later
+        
+        # Collect sample counts from result queue
+        sample_counts = {}
+        for _ in range(num_workers):
+            filename, count = result_queue.get()
+            sample_counts[filename] = count
         
     finally:
         # Cleanup any remaining processes
@@ -202,7 +209,7 @@ def process_sentences_to_multiple_files(in_file, out_dir, num_files=8, ctx_len=1
         # Ensure all data is synced to disk
         os.sync()
     
-    # Print summary and create metadata (calculate from actual files)
+    # Print summary and create metadata using counts from workers
     total_samples = 0
     total_size = 0
     metadata = {
@@ -217,9 +224,8 @@ def process_sentences_to_multiple_files(in_file, out_dir, num_files=8, ctx_len=1
             size = os.path.getsize(filename)
             total_size += size
             
-            # Count samples by counting lines
-            with open(filename, 'r') as f:
-                count = sum(1 for line in f if line.strip())
+            # Use count from worker process
+            count = sample_counts.get(filename, 0)
             total_samples += count
             
             # Add to metadata
