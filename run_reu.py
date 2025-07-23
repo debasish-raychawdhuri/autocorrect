@@ -405,9 +405,9 @@ def save_model_to_onnx(model, onnx_path, context_shape, misspelled_shape, prefix
     model.eval()
     
     # Create dummy inputs with the right shapes
-    dummy_context = torch.randn(1, context_shape[1]).to(next(model.parameters()).device)
-    dummy_misspelled = torch.randn(1, misspelled_shape[1]).to(next(model.parameters()).device)
-    dummy_prefix = torch.randn(1, prefix_shape[1]).to(next(model.parameters()).device)
+    dummy_context = torch.randn(context_shape).to(next(model.parameters()).device)
+    dummy_misspelled = torch.randn(misspelled_shape).to(next(model.parameters()).device)
+    dummy_prefix = torch.randn(prefix_shape).to(next(model.parameters()).device)
     
     # Export to ONNX
     torch.onnx.export(
@@ -976,7 +976,75 @@ if __name__ == "__main__":
         if model_exists:
             print(f"Model file '{model_path}' found, checking compatibility...")
             try:
-                checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+                # Check if it's an ONNX file
+                if model_path.endswith('.onnx'):
+                    print("ONNX model detected - extracting weights for current model architecture...")
+                    try:
+                        import onnx
+                        import onnxruntime as ort
+                        
+                        # Load ONNX model to inspect weights
+                        onnx_model = onnx.load(model_path)
+                        
+                        # Get the model's current state dict structure
+                        current_state_dict = model.state_dict()
+                        
+                        # Extract weights from ONNX and map to current model
+                        checkpoint = {}
+                        
+                        # Get ONNX initializers (weights and biases)
+                        for initializer in onnx_model.graph.initializer:
+                            param_name = initializer.name
+                            param_data = onnx.numpy_helper.to_array(initializer)
+                            
+                            # Direct name matching first
+                            if param_name in current_state_dict:
+                                checkpoint[param_name] = torch.from_numpy(param_data)
+                            else:
+                                # Try common ONNX naming patterns
+                                for pytorch_name in current_state_dict.keys():
+                                    if param_name.endswith(pytorch_name) or pytorch_name.endswith(param_name):
+                                        checkpoint[pytorch_name] = torch.from_numpy(param_data)
+                                        break
+                        
+                        # Strict parameter matching - must have exact same parameters
+                        if len(checkpoint) != len(current_state_dict):
+                            print(f"ONNX parameter count mismatch: {len(checkpoint)} vs {len(current_state_dict)} expected")
+                            print("Model architecture has changed. Cannot resume training.")
+                            exit(1)
+                        
+                        # Check that all expected parameters are present
+                        missing_params = set(current_state_dict.keys()) - set(checkpoint.keys())
+                        if missing_params:
+                            print(f"Missing parameters in ONNX model: {missing_params}")
+                            print("Model architecture has changed. Cannot resume training.")
+                            exit(1)
+                        
+                        # Check for NaN/inf values in loaded weights
+                        nan_params = []
+                        for name, param in checkpoint.items():
+                            if torch.isnan(param).any() or torch.isinf(param).any():
+                                nan_params.append(name)
+                        
+                        if nan_params:
+                            print(f"CORRUPTED ONNX MODEL: Found NaN/inf values in parameters: {nan_params}")
+                            print("The saved model is corrupted. Cannot resume training.")
+                            exit(1)
+                        
+                        print(f"Successfully loaded all {len(checkpoint)} parameters from ONNX model")
+                            
+                    except ImportError as e:
+                        print(f"Missing required library for ONNX loading: {e}")
+                        print("Please install: pip install onnx onnxruntime")
+                        print("Starting training from scratch instead...")
+                        should_resume = False
+                    except Exception as e:
+                        print(f"Error loading ONNX model: {e}")
+                        print("Starting training from scratch instead...")
+                        should_resume = False
+                else:
+                    # Load PyTorch model
+                    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
                 # If saved as state_dict only
                 if isinstance(checkpoint, dict) and "model" in checkpoint:
                     checkpoint = checkpoint["model"]
