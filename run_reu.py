@@ -999,12 +999,12 @@ if __name__ == "__main__":
                             
                             # Direct name matching first
                             if param_name in current_state_dict:
-                                checkpoint[param_name] = torch.from_numpy(param_data)
+                                checkpoint[param_name] = torch.from_numpy(param_data.copy())
                             else:
                                 # Try common ONNX naming patterns
                                 for pytorch_name in current_state_dict.keys():
                                     if param_name.endswith(pytorch_name) or pytorch_name.endswith(param_name):
-                                        checkpoint[pytorch_name] = torch.from_numpy(param_data)
+                                        checkpoint[pytorch_name] = torch.from_numpy(param_data.copy())
                                         break
                         
                         # Strict parameter matching - must have exact same parameters
