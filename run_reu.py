@@ -103,12 +103,12 @@ class SharedBatchBuffer:
             })
         
         # Coordination primitives
-        self.write_idx = 0
-        self.read_idx = 0
-        self.write_lock = threading.Lock()
-        self.read_lock = threading.Lock()
-        self.full_buffers = threading.Semaphore(0)  # Count of ready buffers
-        self.empty_buffers = threading.Semaphore(num_buffers)  # Count of empty buffers
+        self.write_idx = mp.Value('i', 0)
+        self.read_idx = mp.Value('i', 0)
+        self.write_lock = mp.Lock()
+        self.read_lock = mp.Lock()
+        self.full_buffers = mp.Semaphore(0)  # Count of ready buffers
+        self.empty_buffers = mp.Semaphore(num_buffers)  # Count of empty buffers
         
         print(f"Created {num_buffers} shared batch buffers, {self.get_total_memory_mb():.1f} MB total")
     
@@ -123,9 +123,9 @@ class SharedBatchBuffer:
         self.empty_buffers.acquire()  # Wait for empty buffer
         
         with self.write_lock:
-            buffer = self.buffers[self.write_idx]
-            write_idx = self.write_idx
-            self.write_idx = (self.write_idx + 1) % self.num_buffers
+            buffer = self.buffers[self.write_idx.value]
+            write_idx = self.write_idx.value
+            self.write_idx.value = (self.write_idx.value + 1) % self.num_buffers
             
         return buffer, write_idx
     
@@ -140,9 +140,9 @@ class SharedBatchBuffer:
         self.full_buffers.acquire()  # Wait for ready buffer
         
         with self.read_lock:
-            buffer = self.buffers[self.read_idx]
-            read_idx = self.read_idx
-            self.read_idx = (self.read_idx + 1) % self.num_buffers
+            buffer = self.buffers[self.read_idx.value]
+            read_idx = self.read_idx.value
+            self.read_idx.value = (self.read_idx.value + 1) % self.num_buffers
             
         return buffer, read_idx
     
@@ -278,7 +278,7 @@ class SharedMemoryDataLoader:
         
         # Start worker processes
         self.workers = []
-        self.stop_event = threading.Event()
+        self.stop_event = mp.Event()
         
         # Distribute dataset files among workers
         if hasattr(dataset, 'file_paths'):
@@ -293,7 +293,7 @@ class SharedMemoryDataLoader:
                 file_start += files_for_worker
                 
                 # Start worker process
-                worker = threading.Thread(
+                worker = mp.Process(
                     target=self._worker_process,
                     args=(worker_id, worker_files, dataset, batch_size)
                 )
@@ -1374,21 +1374,70 @@ if __name__ == "__main__":
             try:
                 # Check if it's an ONNX file
                 if model_path.endswith('.onnx'):
-                    print("ONNX model detected - converting to PyTorch state dict for training...")
+                    print("ONNX model detected - extracting weights for current model architecture...")
                     try:
                         import onnx
-                        from onnx2torch import convert
+                        import onnxruntime as ort
                         
-                        # Load ONNX model and convert to PyTorch
+                        # Load ONNX model to inspect weights
                         onnx_model = onnx.load(model_path)
-                        torch_model = convert(onnx_model)
                         
-                        # Extract state dict
-                        checkpoint = torch_model.state_dict()
-                        print("Successfully converted ONNX model to PyTorch format")
+                        # Create ONNX Runtime session to extract weights
+                        ort_session = ort.InferenceSession(model_path)
+                        
+                        # Get the model's current state dict structure
+                        current_state_dict = model.state_dict()
+                        
+                        # Extract weights from ONNX and map to current model
+                        checkpoint = {}
+                        
+                        # Debug: Print parameter names for comparison
+                        print("ONNX model parameters:")
+                        onnx_params = [init.name for init in onnx_model.graph.initializer]
+                        for param in onnx_params[:10]:  # Show first 10
+                            print(f"  {param}")
+                        if len(onnx_params) > 10:
+                            print(f"  ... and {len(onnx_params)-10} more")
+                            
+                        print("\nPyTorch model parameters:")
+                        pytorch_params = list(current_state_dict.keys())
+                        for param in pytorch_params[:10]:  # Show first 10
+                            print(f"  {param}")
+                        if len(pytorch_params) > 10:
+                            print(f"  ... and {len(pytorch_params)-10} more")
+                        
+                        # Get ONNX initializers (weights and biases)
+                        for initializer in onnx_model.graph.initializer:
+                            param_name = initializer.name
+                            param_data = onnx.numpy_helper.to_array(initializer)
+                            
+                            # Direct name matching first
+                            if param_name in current_state_dict:
+                                checkpoint[param_name] = torch.from_numpy(param_data)
+                            else:
+                                # Try common ONNX naming patterns
+                                # ONNX often adds numeric suffixes or prefixes
+                                for pytorch_name in current_state_dict.keys():
+                                    if param_name.endswith(pytorch_name) or pytorch_name.endswith(param_name):
+                                        print(f"Mapping ONNX '{param_name}' -> PyTorch '{pytorch_name}'")
+                                        checkpoint[pytorch_name] = torch.from_numpy(param_data)
+                                        break
+                        
+                        # If we couldn't extract enough weights, start from scratch
+                        if len(checkpoint) < len(current_state_dict) * 0.5:  # Less than 50% of params
+                            print(f"Could only extract {len(checkpoint)}/{len(current_state_dict)} parameters from ONNX")
+                            print("Starting training from scratch instead...")
+                            should_resume = False
+                        else:
+                            print(f"Successfully extracted {len(checkpoint)} parameters from ONNX model")
+                            
                     except ImportError as e:
                         print(f"Missing required library for ONNX loading: {e}")
-                        print("Please install: pip install onnx onnx2torch")
+                        print("Please install: pip install onnx onnxruntime")
+                        print("Starting training from scratch instead...")
+                        should_resume = False
+                    except Exception as e:
+                        print(f"Error loading ONNX model: {e}")
                         print("Starting training from scratch instead...")
                         should_resume = False
                 else:
@@ -1504,22 +1553,44 @@ if __name__ == "__main__":
         
         # Load the model weights
         if args.model.endswith('.onnx'):
-            print("Loading ONNX model for prediction...")
+            print("Loading ONNX model weights for prediction...")
             try:
                 import onnx
-                from onnx2torch import convert
+                import onnxruntime as ort
                 
-                # Load ONNX model and convert to PyTorch
+                # Load ONNX model to extract weights
                 onnx_model = onnx.load(args.model)
-                torch_model = convert(onnx_model)
                 
-                # Load the converted state dict
-                model.load_state_dict(torch_model.state_dict())
-                print("Successfully loaded ONNX model")
+                # Get the model's current state dict structure
+                current_state_dict = model.state_dict()
+                
+                # Extract weights from ONNX and map to current model
+                extracted_weights = {}
+                
+                # Get ONNX initializers (weights and biases)
+                for initializer in onnx_model.graph.initializer:
+                    param_name = initializer.name
+                    param_data = onnx.numpy_helper.to_array(initializer)
+                    
+                    # Try to match ONNX parameter names to PyTorch names
+                    if param_name in current_state_dict:
+                        extracted_weights[param_name] = torch.from_numpy(param_data)
+                
+                # Load the extracted weights
+                if len(extracted_weights) > 0:
+                    model.load_state_dict(extracted_weights, strict=False)
+                    print(f"Successfully loaded {len(extracted_weights)} parameters from ONNX model")
+                else:
+                    print("Could not extract weights from ONNX model")
+                    exit(1)
+                    
             except ImportError as e:
                 print(f"Missing required library for ONNX loading: {e}")
-                print("Please install: pip install onnx onnx2torch")
+                print("Please install: pip install onnx onnxruntime")
                 print("Cannot proceed with ONNX model prediction without these libraries.")
+                exit(1)
+            except Exception as e:
+                print(f"Error loading ONNX model: {e}")
                 exit(1)
         else:
             model.load_state_dict(torch.load(args.model, map_location=device, weights_only=False))
