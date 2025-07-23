@@ -1423,24 +1423,31 @@ if __name__ == "__main__":
                                         checkpoint[pytorch_name] = torch.from_numpy(param_data)
                                         break
                         
-                        # If we couldn't extract enough weights, start from scratch
-                        if len(checkpoint) < len(current_state_dict) * 0.5:  # Less than 50% of params
-                            print(f"Could only extract {len(checkpoint)}/{len(current_state_dict)} parameters from ONNX")
-                            print("Starting training from scratch instead...")
-                            should_resume = False
-                        else:
-                            print(f"Successfully extracted {len(checkpoint)} parameters from ONNX model")
-                            
-                            # Check for NaN/inf values in loaded weights
-                            nan_params = []
-                            for name, param in checkpoint.items():
-                                if torch.isnan(param).any() or torch.isinf(param).any():
-                                    nan_params.append(name)
-                            
-                            if nan_params:
-                                print(f"WARNING: Found NaN/inf values in parameters: {nan_params}")
-                                print("This will cause training to fail. Starting from scratch instead...")
-                                should_resume = False
+                        # Strict parameter matching - must have exact same parameters
+                        if len(checkpoint) != len(current_state_dict):
+                            print(f"ONNX parameter count mismatch: {len(checkpoint)} vs {len(current_state_dict)} expected")
+                            print("Model architecture has changed. Cannot resume training.")
+                            exit(1)
+                        
+                        # Check that all expected parameters are present
+                        missing_params = set(current_state_dict.keys()) - set(checkpoint.keys())
+                        if missing_params:
+                            print(f"Missing parameters in ONNX model: {missing_params}")
+                            print("Model architecture has changed. Cannot resume training.")
+                            exit(1)
+                        
+                        # Check for NaN/inf values in loaded weights
+                        nan_params = []
+                        for name, param in checkpoint.items():
+                            if torch.isnan(param).any() or torch.isinf(param).any():
+                                nan_params.append(name)
+                        
+                        if nan_params:
+                            print(f"CORRUPTED ONNX MODEL: Found NaN/inf values in parameters: {nan_params}")
+                            print("The saved model is corrupted. Cannot resume training.")
+                            exit(1)
+                        
+                        print(f"Successfully loaded all {len(checkpoint)} parameters from ONNX model")
                             
                     except ImportError as e:
                         print(f"Missing required library for ONNX loading: {e}")
