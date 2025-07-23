@@ -1372,32 +1372,54 @@ if __name__ == "__main__":
         if model_exists:
             print(f"Model file '{model_path}' found, checking compatibility...")
             try:
-                checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-                # If saved as state_dict only
-                if isinstance(checkpoint, dict) and "model" in checkpoint:
-                    checkpoint = checkpoint["model"]
-                
-                # For multi-GPU models, we need to handle the state dict differently
-                if args.multi_gpu and not is_distributed:
-                    # If loading a non-DataParallel model into DataParallel model
-                    if not any(k.startswith('module.') for k in checkpoint.keys()):
-                        checkpoint = {'module.' + k: v for k, v in checkpoint.items()}
-                elif is_distributed:
-                    # For DDP, similar approach
-                    if not any(k.startswith('module.') for k in checkpoint.keys()):
-                        checkpoint = {'module.' + k: v for k, v in checkpoint.items()}
+                # Check if it's an ONNX file
+                if model_path.endswith('.onnx'):
+                    print("ONNX model detected - converting to PyTorch state dict for training...")
+                    try:
+                        import onnx
+                        from onnx2torch import convert
+                        
+                        # Load ONNX model and convert to PyTorch
+                        onnx_model = onnx.load(model_path)
+                        torch_model = convert(onnx_model)
+                        
+                        # Extract state dict
+                        checkpoint = torch_model.state_dict()
+                        print("Successfully converted ONNX model to PyTorch format")
+                    except ImportError as e:
+                        print(f"Missing required library for ONNX loading: {e}")
+                        print("Please install: pip install onnx onnx2torch")
+                        print("Starting training from scratch instead...")
+                        should_resume = False
                 else:
-                    # If loading a DataParallel model into a non-DataParallel model
-                    if any(k.startswith('module.') for k in checkpoint.keys()):
-                        checkpoint = {k.replace('module.', ''): v for k in checkpoint.keys()}
-                
-                if model_matches(model, checkpoint):
-                    print("Model structure matches. Resuming training from saved model.")
-                    model.load_state_dict(checkpoint)
-                    should_resume = True
-                else:
-                    print("Saved model structure does not match the current code. Exiting for safety.")
-                    exit(1)
+                    # Load PyTorch model
+                    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+                    
+                    # If saved as state_dict only
+                    if isinstance(checkpoint, dict) and "model" in checkpoint:
+                        checkpoint = checkpoint["model"]
+                    
+                    # For multi-GPU models, we need to handle the state dict differently
+                    if args.multi_gpu and not is_distributed:
+                        # If loading a non-DataParallel model into DataParallel model
+                        if not any(k.startswith('module.') for k in checkpoint.keys()):
+                            checkpoint = {'module.' + k: v for k, v in checkpoint.items()}
+                    elif is_distributed:
+                        # For DDP, similar approach
+                        if not any(k.startswith('module.') for k in checkpoint.keys()):
+                            checkpoint = {'module.' + k: v for k, v in checkpoint.items()}
+                    else:
+                        # If loading a DataParallel model into a non-DataParallel model
+                        if any(k.startswith('module.') for k in checkpoint.keys()):
+                            checkpoint = {k.replace('module.', ''): v for k in checkpoint.keys()}
+                    
+                    if model_matches(model, checkpoint):
+                        print("Model structure matches. Resuming training from saved model.")
+                        model.load_state_dict(checkpoint)
+                        should_resume = True
+                    else:
+                        print("Saved model structure does not match the current code. Exiting for safety.")
+                        exit(1)
             except Exception as e:
                 print(f"Error loading model: {e}\nExiting.")
                 exit(1)
@@ -1481,7 +1503,26 @@ if __name__ == "__main__":
             model = model.module
         
         # Load the model weights
-        model.load_state_dict(torch.load(args.model, map_location=device, weights_only=False))
+        if args.model.endswith('.onnx'):
+            print("Loading ONNX model for prediction...")
+            try:
+                import onnx
+                from onnx2torch import convert
+                
+                # Load ONNX model and convert to PyTorch
+                onnx_model = onnx.load(args.model)
+                torch_model = convert(onnx_model)
+                
+                # Load the converted state dict
+                model.load_state_dict(torch_model.state_dict())
+                print("Successfully loaded ONNX model")
+            except ImportError as e:
+                print(f"Missing required library for ONNX loading: {e}")
+                print("Please install: pip install onnx onnx2torch")
+                print("Cannot proceed with ONNX model prediction without these libraries.")
+                exit(1)
+        else:
+            model.load_state_dict(torch.load(args.model, map_location=device, weights_only=False))
         model.eval()
         
         print("Interactive prediction mode. Press Ctrl+C to exit.")
