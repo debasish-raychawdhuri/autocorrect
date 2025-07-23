@@ -70,9 +70,10 @@ def worker(args):
     return batch
 
 def process_sentences_parallel(in_file, out_file, ctx_len=10, n_noisy=10, num_workers=None, batch_size=1000):
-    # Count total sentences for progress tracking
-    with open(in_file, encoding="utf-8") as fin:
-        total_sentences = sum(1 for line in fin if line.strip())
+    # Count total sentences for progress tracking using wc -l
+    import subprocess
+    result = subprocess.run(['wc', '-l', in_file], capture_output=True, text=True)
+    total_sentences = int(result.stdout.split()[0])
     
     num_workers = num_workers or multiprocessing.cpu_count()
     alphabet = "abcdefghijklmnopqrstuvwxyz'"
@@ -125,13 +126,14 @@ def process_sentences_parallel(in_file, out_file, ctx_len=10, n_noisy=10, num_wo
 def process_sentences_to_multiple_files(in_file, out_dir, num_files=8, ctx_len=10, n_noisy=10, num_workers=None, batch_size=1000):
     """Process sentences and distribute output across multiple files"""
     import os
+    import subprocess
     
     # Create output directory
     os.makedirs(out_dir, exist_ok=True)
     
-    # Count total sentences for progress tracking
-    with open(in_file, encoding="utf-8") as fin:
-        total_sentences = sum(1 for line in fin if line.strip())
+    # Count total sentences for progress tracking using wc -l
+    result = subprocess.run(['wc', '-l', in_file], capture_output=True, text=True)
+    total_sentences = int(result.stdout.split()[0])
     
     num_workers = num_workers or multiprocessing.cpu_count()
     alphabet = "abcdefghijklmnopqrstuvwxyz'"
@@ -238,21 +240,25 @@ def load_config(config_path):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
 
-def merge_config_args(config, args):
+def merge_config_args(config, args, provided_args):
     """Merge config file with command line args, giving priority to command line"""
     # Start with config defaults
     merged = config.copy() if config else {}
     
-    # Override with command line args (only non-None values)
+    # Override with command line args (only explicitly provided values)
     args_dict = vars(args)
     for key, value in args_dict.items():
-        if value is not None:
+        if value is not None and key in provided_args:
+            merged[key] = value
+        elif value is not None and key != 'multi_files':
+            # For non-boolean flags, treat non-None as explicitly provided
             merged[key] = value
     
     return merged
 
 if __name__ == "__main__":
     import argparse
+    import sys
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, help="YAML config file path")
     parser.add_argument("--infile", type=str, help="Input sentences file")
@@ -273,8 +279,13 @@ if __name__ == "__main__":
         config = load_config(cmd_args.config)
         print(f"📄 Loaded config from: {cmd_args.config}")
     
+    # Track which args were explicitly provided
+    provided_args = set()
+    if '--multi_files' in sys.argv:
+        provided_args.add('multi_files')
+    
     # Merge config with command line args
-    merged_config = merge_config_args(config, cmd_args)
+    merged_config = merge_config_args(config, cmd_args, provided_args)
     
     # Convert back to object with defaults
     class Config:

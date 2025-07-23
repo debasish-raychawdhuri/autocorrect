@@ -537,15 +537,19 @@ def load_config(config_path):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
 
-def merge_config_args(config, args):
+def merge_config_args(config, args, provided_args):
     """Merge config file with command line args, giving priority to command line"""
     # Start with config defaults
     merged = config.copy() if config else {}
     
-    # Override with command line args (only non-None values)
+    # Override with command line args (only explicitly provided values)
+    boolean_flags = ['train', 'predict', 'multi_gpu', 'distributed']
     args_dict = vars(args)
     for key, value in args_dict.items():
-        if value is not None:
+        if value is not None and key in provided_args:
+            merged[key] = value
+        elif value is not None and key not in boolean_flags:
+            # For non-boolean flags, treat non-None as explicitly provided
             merged[key] = value
     
     return merged
@@ -553,6 +557,7 @@ def merge_config_args(config, args):
 if __name__ == "__main__":
     # Set multiprocessing start method
     import multiprocessing as mp
+    import sys
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, help="YAML config file path")
@@ -587,8 +592,15 @@ if __name__ == "__main__":
         config = load_config(cmd_args.config)
         print(f"📄 Loaded config from: {cmd_args.config}")
     
+    # Track which boolean args were explicitly provided
+    provided_args = set()
+    boolean_flags = ['train', 'predict', 'multi_gpu', 'distributed']
+    for flag in boolean_flags:
+        if f'--{flag}' in sys.argv:
+            provided_args.add(flag)
+    
     # Merge config with command line args
-    merged_config = merge_config_args(config, cmd_args)
+    merged_config = merge_config_args(config, cmd_args, provided_args)
     
     # Convert back to argparse Namespace with defaults
     class Config:
