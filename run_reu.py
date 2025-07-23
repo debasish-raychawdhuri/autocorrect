@@ -17,12 +17,408 @@ import signal
 import torch.onnx
 import yaml
 from datetime import timedelta
-from multiprocessing import shared_memory
+from multiprocessing import shared_memory, Lock, Semaphore
 import pickle
+import threading
+import queue
 
 # Global shared memory for word2vec
 _shared_w2v_memory = None
 _shared_w2v_metadata = None
+
+# Global shared memory for batches
+_shared_batch_buffers = None
+_shared_batch_metadata = None
+
+class SharedBatchBuffer:
+    """Ring buffer system for shared memory batches"""
+    
+    def __init__(self, num_buffers, batch_size, context_dim, word_onehot_dim, gen_onehot_dim):
+        self.num_buffers = num_buffers
+        self.batch_size = batch_size
+        self.context_dim = context_dim
+        self.word_onehot_dim = word_onehot_dim
+        self.gen_onehot_dim = gen_onehot_dim
+        
+        # Calculate buffer sizes
+        self.context_size = batch_size * context_dim
+        self.word_onehot_size = batch_size * word_onehot_dim
+        self.gen_onehot_size = batch_size * gen_onehot_dim
+        self.target_size = batch_size
+        
+        # Create shared memory for each buffer
+        self.buffers = []
+        for i in range(num_buffers):
+            # Create shared memory for this buffer
+            context_shm = shared_memory.SharedMemory(
+                create=True, 
+                size=self.context_size * 4  # float32 = 4 bytes
+            )
+            word_onehot_shm = shared_memory.SharedMemory(
+                create=True, 
+                size=self.word_onehot_size * 4  # float32 = 4 bytes
+            )
+            gen_onehot_shm = shared_memory.SharedMemory(
+                create=True, 
+                size=self.gen_onehot_size * 4  # float32 = 4 bytes
+            )
+            target_shm = shared_memory.SharedMemory(
+                create=True, 
+                size=self.target_size * 8  # int64 = 8 bytes
+            )
+            
+            # Create numpy arrays backed by shared memory
+            context_array = np.ndarray(
+                (batch_size, context_dim), 
+                dtype=np.float32, 
+                buffer=context_shm.buf
+            )
+            word_onehot_array = np.ndarray(
+                (batch_size, word_onehot_dim), 
+                dtype=np.float32, 
+                buffer=word_onehot_shm.buf
+            )
+            gen_onehot_array = np.ndarray(
+                (batch_size, gen_onehot_dim), 
+                dtype=np.float32, 
+                buffer=gen_onehot_shm.buf
+            )
+            target_array = np.ndarray(
+                (batch_size,), 
+                dtype=np.int64, 
+                buffer=target_shm.buf
+            )
+            
+            self.buffers.append({
+                'context_shm': context_shm,
+                'word_onehot_shm': word_onehot_shm,
+                'gen_onehot_shm': gen_onehot_shm,
+                'target_shm': target_shm,
+                'context_array': context_array,
+                'word_onehot_array': word_onehot_array,
+                'gen_onehot_array': gen_onehot_array,
+                'target_array': target_array,
+                'ready': False,
+                'sample_count': 0
+            })
+        
+        # Coordination primitives
+        self.write_idx = 0
+        self.read_idx = 0
+        self.write_lock = threading.Lock()
+        self.read_lock = threading.Lock()
+        self.full_buffers = threading.Semaphore(0)  # Count of ready buffers
+        self.empty_buffers = threading.Semaphore(num_buffers)  # Count of empty buffers
+        
+        print(f"Created {num_buffers} shared batch buffers, {self.get_total_memory_mb():.1f} MB total")
+    
+    def get_total_memory_mb(self):
+        """Calculate total memory usage in MB"""
+        per_buffer_mb = (self.context_size * 4 + self.word_onehot_size * 4 + 
+                        self.gen_onehot_size * 4 + self.target_size * 8) / (1024 * 1024)
+        return per_buffer_mb * self.num_buffers
+    
+    def get_write_buffer(self):
+        """Get next buffer for writing (blocks if all buffers full)"""
+        self.empty_buffers.acquire()  # Wait for empty buffer
+        
+        with self.write_lock:
+            buffer = self.buffers[self.write_idx]
+            write_idx = self.write_idx
+            self.write_idx = (self.write_idx + 1) % self.num_buffers
+            
+        return buffer, write_idx
+    
+    def mark_buffer_ready(self, buffer_idx, sample_count):
+        """Mark buffer as ready for reading"""
+        self.buffers[buffer_idx]['ready'] = True
+        self.buffers[buffer_idx]['sample_count'] = sample_count
+        self.full_buffers.release()  # Signal that buffer is ready
+    
+    def get_read_buffer(self):
+        """Get next buffer for reading (blocks if no buffers ready)"""
+        self.full_buffers.acquire()  # Wait for ready buffer
+        
+        with self.read_lock:
+            buffer = self.buffers[self.read_idx]
+            read_idx = self.read_idx
+            self.read_idx = (self.read_idx + 1) % self.num_buffers
+            
+        return buffer, read_idx
+    
+    def mark_buffer_consumed(self, buffer_idx):
+        """Mark buffer as consumed and available for writing"""
+        self.buffers[buffer_idx]['ready'] = False
+        self.buffers[buffer_idx]['sample_count'] = 0
+        self.empty_buffers.release()  # Signal that buffer is empty
+    
+    def cleanup(self):
+        """Clean up all shared memory buffers"""
+        for buffer in self.buffers:
+            buffer['context_shm'].close()
+            buffer['context_shm'].unlink()
+            buffer['word_onehot_shm'].close()
+            buffer['word_onehot_shm'].unlink()
+            buffer['gen_onehot_shm'].close()
+            buffer['gen_onehot_shm'].unlink()
+            buffer['target_shm'].close()
+            buffer['target_shm'].unlink()
+        print("Shared batch buffers cleaned up")
+
+class SharedBatchBufferView:
+    """Worker view of shared batch buffers"""
+    
+    def __init__(self, metadata):
+        self.metadata = metadata
+        self.batch_size = metadata['batch_size']
+        self.context_dim = metadata['context_dim']
+        self.word_onehot_dim = metadata['word_onehot_dim']
+        self.gen_onehot_dim = metadata['gen_onehot_dim']
+        
+        # Attach to existing shared memory buffers
+        self.buffers = []
+        for buffer_info in metadata['buffer_info']:
+            # Attach to shared memory
+            context_shm = shared_memory.SharedMemory(name=buffer_info['context_name'])
+            word_onehot_shm = shared_memory.SharedMemory(name=buffer_info['word_onehot_name'])
+            gen_onehot_shm = shared_memory.SharedMemory(name=buffer_info['gen_onehot_name'])
+            target_shm = shared_memory.SharedMemory(name=buffer_info['target_name'])
+            
+            # Create numpy array views
+            context_array = np.ndarray(
+                (self.batch_size, self.context_dim), 
+                dtype=np.float32, 
+                buffer=context_shm.buf
+            )
+            word_onehot_array = np.ndarray(
+                (self.batch_size, self.word_onehot_dim), 
+                dtype=np.float32, 
+                buffer=word_onehot_shm.buf
+            )
+            gen_onehot_array = np.ndarray(
+                (self.batch_size, self.gen_onehot_dim), 
+                dtype=np.float32, 
+                buffer=gen_onehot_shm.buf
+            )
+            target_array = np.ndarray(
+                (self.batch_size,), 
+                dtype=np.int64, 
+                buffer=target_shm.buf
+            )
+            
+            self.buffers.append({
+                'context_shm': context_shm,
+                'word_onehot_shm': word_onehot_shm,
+                'gen_onehot_shm': gen_onehot_shm,
+                'target_shm': target_shm,
+                'context_array': context_array,
+                'word_onehot_array': word_onehot_array,
+                'gen_onehot_array': gen_onehot_array,
+                'target_array': target_array
+            })
+
+def create_shared_batch_buffers(num_buffers, batch_size, context_dim, word_onehot_dim, gen_onehot_dim):
+    """Create shared memory batch buffer system"""
+    global _shared_batch_buffers, _shared_batch_metadata
+    
+    print(f"Creating shared batch buffers: {num_buffers} buffers × {batch_size} batch size")
+    
+    buffer_system = SharedBatchBuffer(
+        num_buffers, batch_size, context_dim, word_onehot_dim, gen_onehot_dim
+    )
+    
+    # Create metadata for workers
+    buffer_info = []
+    for buffer in buffer_system.buffers:
+        buffer_info.append({
+            'context_name': buffer['context_shm'].name,
+            'word_onehot_name': buffer['word_onehot_shm'].name,
+            'gen_onehot_name': buffer['gen_onehot_shm'].name,
+            'target_name': buffer['target_shm'].name
+        })
+    
+    metadata = {
+        'num_buffers': num_buffers,
+        'batch_size': batch_size,
+        'context_dim': context_dim,
+        'word_onehot_dim': word_onehot_dim,
+        'gen_onehot_dim': gen_onehot_dim,
+        'buffer_info': buffer_info
+    }
+    
+    _shared_batch_buffers = buffer_system
+    _shared_batch_metadata = metadata
+    
+    return buffer_system
+
+def get_shared_batch_buffers():
+    """Get shared batch buffer view for worker processes"""
+    global _shared_batch_metadata
+    if _shared_batch_metadata is None:
+        raise RuntimeError("Shared batch buffers not initialized")
+    
+    return SharedBatchBufferView(_shared_batch_metadata)
+
+def cleanup_shared_batch_buffers():
+    """Cleanup shared batch buffer system"""
+    global _shared_batch_buffers
+    if _shared_batch_buffers is not None:
+        _shared_batch_buffers.cleanup()
+        _shared_batch_buffers = None
+        print("Shared batch buffers cleaned up")
+
+class SharedMemoryDataLoader:
+    """Custom DataLoader that uses shared memory batches"""
+    
+    def __init__(self, dataset, batch_size, num_workers, batch_buffer_system):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.batch_buffer_system = batch_buffer_system
+        
+        # Start worker processes
+        self.workers = []
+        self.stop_event = threading.Event()
+        
+        # Distribute dataset files among workers
+        if hasattr(dataset, 'file_paths'):
+            files_per_worker = len(dataset.file_paths) // num_workers
+            remaining_files = len(dataset.file_paths) % num_workers
+            
+            file_start = 0
+            for worker_id in range(num_workers):
+                # Calculate files for this worker
+                files_for_worker = files_per_worker + (1 if worker_id < remaining_files else 0)
+                worker_files = dataset.file_paths[file_start:file_start + files_for_worker]
+                file_start += files_for_worker
+                
+                # Start worker process
+                worker = threading.Thread(
+                    target=self._worker_process,
+                    args=(worker_id, worker_files, dataset, batch_size)
+                )
+                worker.daemon = True
+                worker.start()
+                self.workers.append(worker)
+        
+        print(f"Started {len(self.workers)} worker threads for shared memory data loading")
+    
+    def _worker_process(self, worker_id, file_paths, dataset, batch_size):
+        """Worker process that fills shared memory buffers"""
+        try:
+            # Get worker-specific word2vec model
+            if dataset.use_shared_memory and dataset.shm_name:
+                w2v_model = SharedWord2Vec(dataset.shm_name, dataset.w2v_metadata)
+            else:
+                w2v_model = dataset.w2v_model
+            
+            # Create data generator
+            def data_generator():
+                while not self.stop_event.is_set():
+                    for file_path in file_paths:
+                        if self.stop_event.is_set():
+                            break
+                        
+                        with open(file_path, encoding="utf-8", buffering=8*1024*1024) as f:
+                            batch_samples = []
+                            
+                            for line in f:
+                                if self.stop_event.is_set():
+                                    break
+                                
+                                sample = json.loads(line.strip())
+                                context = pad_context(sample["context"], dataset.ctx_len)
+                                misspelled = sample["misspelled"]
+                                prefix = sample["generated_prefix"]
+                                next_char = sample["next_char"]
+                                
+                                context_vec = vectorize_context(context, w2v_model, dataset.ctx_len)
+                                misspelled_oh = one_hot_chars(misspelled, dataset.char_to_id, dataset.max_word_len)
+                                prefix_oh = one_hot_chars(prefix, dataset.char_to_id, dataset.max_gen_len)
+                                
+                                if next_char == "<eow>":
+                                    next_id = dataset.char_to_id["<eow>"]
+                                else:
+                                    next_id = dataset.char_to_id.get(next_char, 0)
+                                
+                                batch_samples.append((context_vec, misspelled_oh, prefix_oh, next_id))
+                                
+                                # When we have a full batch, write to shared memory
+                                if len(batch_samples) == batch_size:
+                                    self._write_batch_to_shared_memory(batch_samples, batch_size)
+                                    batch_samples = []
+                            
+                            # Handle remaining samples
+                            if batch_samples and not self.stop_event.is_set():
+                                self._write_batch_to_shared_memory(batch_samples, len(batch_samples))
+            
+            # Start data generation
+            data_generator()
+            
+        except Exception as e:
+            print(f"Worker {worker_id} error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _write_batch_to_shared_memory(self, batch_samples, actual_batch_size):
+        """Write batch to shared memory buffer"""
+        # Get next available buffer
+        buffer, buffer_idx = self.batch_buffer_system.get_write_buffer()
+        
+        # Fill the buffer
+        for i, (context_vec, misspelled_oh, prefix_oh, next_id) in enumerate(batch_samples):
+            buffer['context_array'][i] = context_vec
+            buffer['word_onehot_array'][i] = misspelled_oh
+            buffer['gen_onehot_array'][i] = prefix_oh
+            buffer['target_array'][i] = next_id
+        
+        # Zero out unused slots if batch is smaller than batch_size
+        if actual_batch_size < self.batch_size:
+            for i in range(actual_batch_size, self.batch_size):
+                buffer['context_array'][i].fill(0)
+                buffer['word_onehot_array'][i].fill(0)
+                buffer['gen_onehot_array'][i].fill(0)
+                buffer['target_array'][i] = 0
+        
+        # Mark buffer as ready
+        self.batch_buffer_system.mark_buffer_ready(buffer_idx, actual_batch_size)
+    
+    def __iter__(self):
+        """Iterator that reads from shared memory buffers"""
+        while True:
+            try:
+                # Get next ready buffer
+                buffer, buffer_idx = self.batch_buffer_system.get_read_buffer()
+                actual_batch_size = buffer['sample_count']
+                
+                # Create tensors from shared memory arrays
+                if actual_batch_size == self.batch_size:
+                    # Full batch - use entire arrays
+                    context_tensor = torch.from_numpy(buffer['context_array'].copy())
+                    word_onehot_tensor = torch.from_numpy(buffer['word_onehot_array'].copy())
+                    gen_onehot_tensor = torch.from_numpy(buffer['gen_onehot_array'].copy())
+                    target_tensor = torch.from_numpy(buffer['target_array'].copy())
+                else:
+                    # Partial batch - slice to actual size
+                    context_tensor = torch.from_numpy(buffer['context_array'][:actual_batch_size].copy())
+                    word_onehot_tensor = torch.from_numpy(buffer['word_onehot_array'][:actual_batch_size].copy())
+                    gen_onehot_tensor = torch.from_numpy(buffer['gen_onehot_array'][:actual_batch_size].copy())
+                    target_tensor = torch.from_numpy(buffer['target_array'][:actual_batch_size].copy())
+                
+                # Mark buffer as consumed
+                self.batch_buffer_system.mark_buffer_consumed(buffer_idx)
+                
+                yield (context_tensor, word_onehot_tensor, gen_onehot_tensor, target_tensor)
+                
+            except Exception as e:
+                print(f"DataLoader iterator error: {e}")
+                break
+    
+    def stop(self):
+        """Stop all worker processes"""
+        self.stop_event.set()
+        for worker in self.workers:
+            worker.join(timeout=1.0)
 
 class SharedWord2Vec:
     """Wrapper for word2vec model in shared memory"""
@@ -1021,31 +1417,37 @@ if __name__ == "__main__":
             use_shared_memory=use_shared_memory
         )
         
-        # Setup data loading based on distributed mode
-        if is_distributed:
-            # IterableDataset doesn't use samplers - data distribution is handled by workers reading different files
-            workers_per_process = max(1, args.num_workers // max(1, torch.cuda.device_count()))
-            dataloader = DataLoader(
-                dataset, 
+        # Create shared memory batch buffers for high-performance data loading
+        if args.num_workers > 0:
+            # Calculate number of buffers - enough to keep GPU busy while workers fill new ones
+            num_buffers = min(20, args.num_workers * 2)  # 2 buffers per worker, max 20
+            
+            print(f"Creating shared memory batch buffer system...")
+            batch_buffer_system = create_shared_batch_buffers(
+                num_buffers=num_buffers,
                 batch_size=args.batch_size,
-                num_workers=workers_per_process,
-                pin_memory=True,
-                persistent_workers=True if workers_per_process > 0 else False,
-                prefetch_factor=2,
-                drop_last=True  # Ensure consistent batch sizes across ranks
+                context_dim=context_dim,
+                word_onehot_dim=word_onehot_dim,
+                gen_onehot_dim=gen_onehot_dim
             )
-            print(f"Rank {local_rank}: Distributed streaming DataLoader created with {workers_per_process} workers per process")
+            
+            # Use custom shared memory DataLoader
+            dataloader = SharedMemoryDataLoader(
+                dataset=dataset,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                batch_buffer_system=batch_buffer_system
+            )
+            print(f"Created shared memory DataLoader with {args.num_workers} workers and {num_buffers} buffers")
         else:
-            # Regular DataLoader for single GPU or DataParallel
+            # Fallback to regular DataLoader for single-process mode
             dataloader = DataLoader(
                 dataset, 
                 batch_size=args.batch_size, 
-                num_workers=args.num_workers,
-                pin_memory=True,
-                persistent_workers=True,
-                prefetch_factor=2
+                num_workers=0,
+                pin_memory=True
             )
-            print(f"Streaming DataLoader created with {args.num_workers} worker processes")
+            print(f"Using regular DataLoader (single-process mode)")
         
         # Train the model (update is_distributed flag based on actual state)
         train_model(
@@ -1067,6 +1469,11 @@ if __name__ == "__main__":
         # Cleanup shared memory after training
         if use_shared_memory:
             cleanup_shared_word2vec()
+        
+        # Cleanup shared batch buffers
+        if args.num_workers > 0 and hasattr(dataloader, 'stop'):
+            dataloader.stop()
+            cleanup_shared_batch_buffers()
         
     elif args.predict:
         # For prediction, we need to unwrap the model if it's wrapped in DataParallel or DDP
