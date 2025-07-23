@@ -801,9 +801,9 @@ def save_model_to_onnx(model, onnx_path, context_shape, misspelled_shape, prefix
     model.eval()
     
     # Create dummy inputs with the right shapes
-    dummy_context = torch.randn(1, context_shape[1]).to(next(model.parameters()).device)
-    dummy_misspelled = torch.randn(1, misspelled_shape[1]).to(next(model.parameters()).device)
-    dummy_prefix = torch.randn(1, prefix_shape[1]).to(next(model.parameters()).device)
+    dummy_context = torch.randn(context_shape).to(next(model.parameters()).device)
+    dummy_misspelled = torch.randn(misspelled_shape).to(next(model.parameters()).device)
+    dummy_prefix = torch.randn(prefix_shape).to(next(model.parameters()).device)
     
     # Export to ONNX
     torch.onnx.export(
