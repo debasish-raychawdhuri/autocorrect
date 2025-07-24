@@ -469,6 +469,45 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
     if is_distributed:
         dist.barrier()
     
+    def process_batch(current_tensors, model, optimizer, epoch_loss, batch_count, loop, is_distributed, local_rank, save_requested, save_path, context_dim, word_onehot_dim, gen_onehot_dim):
+        """Process a single batch and return updated loss and count"""
+        context_vec, misspelled_oh, prefix_oh, next_id = current_tensors
+        
+        # Compute forward pass
+        logits = model(context_vec, misspelled_oh, prefix_oh)
+        loss = F.cross_entropy(logits, next_id)
+        
+        optimizer.zero_grad()
+        loss.backward()
+        
+        # Synchronize gradients before clipping in distributed mode
+        if is_distributed:
+            torch.cuda.synchronize()
+        
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        
+        # Add explicit CUDA synchronization for multi-GPU stability
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        
+        epoch_loss += loss.item()
+        batch_count += 1
+        
+        if not is_distributed or local_rank == 0:
+            if isinstance(loop, tqdm):
+                if hasattr(loop, 'set_postfix'):
+                    loop.set_postfix(loss=loss.item())
+        
+        # Check if save was requested (only save on main process)
+        if save_requested[0] and (not is_distributed or local_rank == 0):
+            print(f"\n💾 Saving model on demand...")
+            save_model(model, save_path, context_dim, word_onehot_dim, gen_onehot_dim, is_distributed)
+            print(f"✅ Model saved to {save_path}")
+            save_requested[0] = False
+        
+        return epoch_loss, batch_count
+
     for epoch in range(epochs):
         epoch_loss = 0.0
         batch_count = 0
@@ -496,75 +535,67 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
         # Convert dataloader to iterator for pipelining
         dataiter = iter(loop)
         
-        # Prefetch first batch
+        # Bootstrap: load and transfer first batch synchronously
         try:
-            next_batch = next(dataiter)
+            first_batch = next(dataiter)
         except StopIteration:
             continue  # Empty dataloader
+            
+        # Transfer first batch to GPU and wait
+        if transfer_stream is not None:
+            with torch.cuda.stream(transfer_stream):
+                current_tensors = (
+                    first_batch[0].to(device, non_blocking=True),
+                    first_batch[1].to(device, non_blocking=True),
+                    first_batch[2].to(device, non_blocking=True),
+                    first_batch[3].to(device, non_blocking=True)
+                )
+            current_event = torch.cuda.Event()
+            current_event.record(transfer_stream)
+            current_event.wait()  # First batch must complete before starting pipeline
+        else:
+            current_tensors = (
+                first_batch[0].to(device),
+                first_batch[1].to(device),
+                first_batch[2].to(device),
+                first_batch[3].to(device)
+            )
+            current_event = None
         
-        # Pipeline: transfer next batch while computing current batch
+        # Pipeline loop: compute current while transferring next
         while True:
-            # Current batch data
-            context_vec, misspelled_oh, prefix_oh, next_id = next_batch
-            
-            # Start transferring current batch to GPU
-            if transfer_stream is not None:
-                with torch.cuda.stream(transfer_stream):
-                    context_vec = context_vec.to(device, non_blocking=True)
-                    misspelled_oh = misspelled_oh.to(device, non_blocking=True)
-                    prefix_oh = prefix_oh.to(device, non_blocking=True)
-                    next_id = next_id.to(device, non_blocking=True)
-            else:
-                context_vec = context_vec.to(device)
-                misspelled_oh = misspelled_oh.to(device)
-                prefix_oh = prefix_oh.to(device)
-                next_id = next_id.to(device)
-            
-            # Try to prefetch next batch while current transfers
+            # Start next batch transfer (if available)
             try:
                 next_batch = next(dataiter)
+                if transfer_stream is not None:
+                    with torch.cuda.stream(transfer_stream):
+                        next_tensors = (
+                            next_batch[0].to(device, non_blocking=True),
+                            next_batch[1].to(device, non_blocking=True),
+                            next_batch[2].to(device, non_blocking=True),
+                            next_batch[3].to(device, non_blocking=True)
+                        )
+                    next_event = torch.cuda.Event()
+                    next_event.record(transfer_stream)
+                else:
+                    next_tensors = (
+                        next_batch[0].to(device),
+                        next_batch[1].to(device),
+                        next_batch[2].to(device),
+                        next_batch[3].to(device)
+                    )
+                    next_event = None
             except StopIteration:
-                next_batch = None
+                next_tensors = None
+                next_event = None
             
-            # Wait for current batch transfer to complete
-            if transfer_stream is not None:
-                transfer_stream.synchronize()
+            # Process current batch (while next transfers in background)
             try:
-                # Compute forward pass (tensors already transferred above)
-                logits = model(context_vec, misspelled_oh, prefix_oh)
-                loss = F.cross_entropy(logits, next_id)
-                
-                optimizer.zero_grad()
-                loss.backward()
-                
-                # Synchronize gradients before clipping in distributed mode
-                if is_distributed:
-                    torch.cuda.synchronize()
-                
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Gradient clipping
-                optimizer.step()
-                
-                # Add explicit CUDA synchronization for multi-GPU stability
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                
-                epoch_loss += loss.item()
-                batch_count += 1
-                
-                if not is_distributed or local_rank == 0:
-                    if isinstance(loop, tqdm):
-                        if hasattr(loop, 'set_postfix'):
-                            loop.set_postfix(loss=loss.item())
-                
-                # Check if save was requested (only save on main process)
-                if save_requested[0] and (not is_distributed or local_rank == 0):
-                    print(f"\n💾 Saving model on demand...")
-                    
-                    save_model(model, save_path, context_dim, word_onehot_dim, gen_onehot_dim, is_distributed)
-                    
-                    print(f"✅ Model saved to {save_path}")
-                    save_requested[0] = False
-                        
+                epoch_loss, batch_count = process_batch(
+                    current_tensors, model, optimizer, epoch_loss, batch_count, 
+                    loop, is_distributed, local_rank, save_requested, save_path, 
+                    context_dim, word_onehot_dim, gen_onehot_dim
+                )
             except RuntimeError as e:
                 if "CUDA" in str(e) or "illegal memory access" in str(e):
                     print(f"CUDA error on rank {local_rank}: {e}")
@@ -577,8 +608,28 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
                     raise e
             
             # Break if no more batches
-            if next_batch is None:
+            if next_tensors is None:
                 break
+                
+            # Swap: next becomes current for next iteration
+            if next_event is not None:
+                next_event.wait()
+            current_tensors = next_tensors
+            current_event = next_event
+        
+        # Process the final batch that's still in current_tensors
+        try:
+            epoch_loss, batch_count = process_batch(
+                current_tensors, model, optimizer, epoch_loss, batch_count, 
+                loop, is_distributed, local_rank, save_requested, save_path, 
+                context_dim, word_onehot_dim, gen_onehot_dim
+            )
+        except RuntimeError as e:
+            if "CUDA" in str(e) or "illegal memory access" in str(e):
+                print(f"CUDA error on final batch: {e}")
+                torch.cuda.empty_cache()
+            else:
+                raise e
         
         # Calculate average loss
         avg_loss = epoch_loss / batch_count
