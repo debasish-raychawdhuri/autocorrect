@@ -333,10 +333,7 @@ class CharGenStreamingDataset(IterableDataset):
                     misspelled_oh = one_hot_chars(misspelled, self.char_to_id, self.max_word_len)
                     prefix_oh = one_hot_chars(prefix, self.char_to_id, self.max_gen_len)
                     
-                    if next_char == "<eow>":
-                        next_id = self.char_to_id["<eow>"]
-                    else:
-                        next_id = self.char_to_id.get(next_char, 0)
+                    next_id = self.char_to_id.get(next_char, 0)
                     
                     yield (
                         torch.tensor(context_vec, dtype=torch.float32),
