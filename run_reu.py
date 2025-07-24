@@ -50,6 +50,14 @@ class SharedWord2Vec:
             raise KeyError(f"Word '{word}' not in vocabulary")
         idx = self.word_to_index[word]
         return self.vectors[idx]
+    
+    def __del__(self):
+        """Clean up shared memory handle when instance is deleted"""
+        if hasattr(self, 'shm') and self.shm is not None:
+            try:
+                self.shm.close()
+            except:
+                pass  # Ignore errors during cleanup
 
 def create_shared_word2vec(w2v_model):
     """Create shared memory version of word2vec model"""
@@ -300,10 +308,12 @@ class CharGenStreamingDataset(IterableDataset):
         return self._build_offsets_sequential()
 
     def __iter__(self):
-        # Get worker-specific word2vec model
+        # Get worker-specific word2vec model, reuse if already created
         if self.use_shared_memory and self.shm_name:
-            # Worker process - attach to shared memory
-            w2v_model = SharedWord2Vec(self.shm_name, self.w2v_metadata)
+            # Worker process - reuse existing SharedWord2Vec or create new one
+            if not hasattr(self, '_worker_w2v_model') or self._worker_w2v_model is None:
+                self._worker_w2v_model = SharedWord2Vec(self.shm_name, self.w2v_metadata)
+            w2v_model = self._worker_w2v_model
         else:
             # Use the original model
             w2v_model = self.w2v_model
