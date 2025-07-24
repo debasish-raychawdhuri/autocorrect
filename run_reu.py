@@ -477,26 +477,60 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
         if is_distributed and hasattr(dataloader.sampler, 'set_epoch'):
             dataloader.sampler.set_epoch(epoch)
             
+        # Create CUDA streams for pipelining
+        if torch.cuda.is_available():
+            transfer_stream = torch.cuda.Stream()
+            compute_stream = torch.cuda.current_stream()
+        else:
+            transfer_stream = None
+            compute_stream = None
+        
         # Use tqdm only on main process if distributed
         if not is_distributed or local_rank == 0:
             # Calculate total batches if we have total_samples
             total_batches = total_samples // batch_size if total_samples else None
-            loop = tqdm(dataloader, desc=f"Epoch {epoch+1}", unit="batch", total=total_batches)
+            loop = tqdm(dataloader, desc=f"Epoch {epoch+1}", unit="batch", total=total_batches, mininterval=60)
         else:
             loop = dataloader
+        
+        # Convert dataloader to iterator for pipelining
+        dataiter = iter(loop)
+        
+        # Prefetch first batch
+        try:
+            next_batch = next(dataiter)
+        except StopIteration:
+            continue  # Empty dataloader
+        
+        # Pipeline: transfer next batch while computing current batch
+        while True:
+            # Current batch data
+            context_vec, misspelled_oh, prefix_oh, next_id = next_batch
             
-        for context_vec, misspelled_oh, prefix_oh, next_id in loop:
+            # Start transferring current batch to GPU
+            if transfer_stream is not None:
+                with torch.cuda.stream(transfer_stream):
+                    context_vec = context_vec.to(device, non_blocking=True)
+                    misspelled_oh = misspelled_oh.to(device, non_blocking=True)
+                    prefix_oh = prefix_oh.to(device, non_blocking=True)
+                    next_id = next_id.to(device, non_blocking=True)
+            else:
+                context_vec = context_vec.to(device)
+                misspelled_oh = misspelled_oh.to(device)
+                prefix_oh = prefix_oh.to(device)
+                next_id = next_id.to(device)
+            
+            # Try to prefetch next batch while current transfers
             try:
-                # Ensure tensors are on the correct device with proper synchronization
-                context_vec = context_vec.to(device, non_blocking=True)
-                misspelled_oh = misspelled_oh.to(device, non_blocking=True)
-                prefix_oh = prefix_oh.to(device, non_blocking=True)
-                next_id = next_id.to(device, non_blocking=True)
-                
-                # Wait for data transfer to complete before forward pass
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                
+                next_batch = next(dataiter)
+            except StopIteration:
+                next_batch = None
+            
+            # Wait for current batch transfer to complete
+            if transfer_stream is not None:
+                transfer_stream.synchronize()
+            try:
+                # Compute forward pass (tensors already transferred above)
                 logits = model(context_vec, misspelled_oh, prefix_oh)
                 loss = F.cross_entropy(logits, next_id)
                 
@@ -519,7 +553,8 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
                 
                 if not is_distributed or local_rank == 0:
                     if isinstance(loop, tqdm):
-                        loop.set_postfix(loss=loss.item())
+                        if hasattr(loop, 'set_postfix'):
+                            loop.set_postfix(loss=loss.item())
                 
                 # Check if save was requested (only save on main process)
                 if save_requested[0] and (not is_distributed or local_rank == 0):
@@ -540,6 +575,10 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
                     continue
                 else:
                     raise e
+            
+            # Break if no more batches
+            if next_batch is None:
+                break
         
         # Calculate average loss
         avg_loss = epoch_loss / batch_count
