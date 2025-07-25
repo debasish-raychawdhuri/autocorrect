@@ -618,6 +618,113 @@ def predict_word(model, w2v_model, char_to_id, id_to_char, context_words, misspe
         
         return results[:10]
 
+def test_model(model, dataloader, char_to_id, id_to_char, local_rank=0, is_distributed=False):
+    """Evaluate model on test data and compute accuracy, loss, and confusion matrix"""
+    model.eval()
+    total_loss = 0.0
+    total_samples = 0
+    correct_predictions = 0
+    
+    # For confusion matrix - track predicted vs actual characters
+    char_vocab_size = len(char_to_id)
+    confusion_matrix = torch.zeros(char_vocab_size, char_vocab_size, dtype=torch.long)
+    
+    # Use tqdm only on main process if distributed
+    if not is_distributed or local_rank == 0:
+        loop = tqdm(dataloader, desc="Testing", unit="batch")
+    else:
+        loop = dataloader
+    
+    with torch.no_grad():
+        for batch in loop:
+            context_vec, misspelled_oh, prefix_oh, next_id = batch
+            
+            # Transfer to GPU
+            context_vec = context_vec.to(device)
+            misspelled_oh = misspelled_oh.to(device)
+            prefix_oh = prefix_oh.to(device)
+            next_id = next_id.to(device)
+            
+            try:
+                # Forward pass
+                logits = model(context_vec, misspelled_oh, prefix_oh)
+                loss = F.cross_entropy(logits, next_id)
+                
+                # Get predictions
+                predicted = torch.argmax(logits, dim=1)
+                
+                # Update metrics
+                batch_size = next_id.size(0)
+                total_loss += loss.item() * batch_size
+                total_samples += batch_size
+                correct_predictions += (predicted == next_id).sum().item()
+                
+                # Update confusion matrix
+                for actual, pred in zip(next_id.cpu(), predicted.cpu()):
+                    confusion_matrix[actual.item(), pred.item()] += 1
+                
+                # Update progress bar
+                if not is_distributed or local_rank == 0:
+                    if isinstance(loop, tqdm):
+                        current_acc = correct_predictions / total_samples
+                        loop.set_postfix(loss=loss.item(), accuracy=f"{current_acc:.4f}")
+                        
+            except RuntimeError as e:
+                if "CUDA" in str(e) or "illegal memory access" in str(e):
+                    print(f"CUDA error during testing: {e}")
+                    torch.cuda.empty_cache()
+                    if is_distributed:
+                        dist.barrier()
+                    continue
+                else:
+                    raise e
+    
+    # Calculate final metrics
+    avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
+    accuracy = correct_predictions / total_samples if total_samples > 0 else 0.0
+    
+    # Print results (only on main process if distributed)
+    if not is_distributed or local_rank == 0:
+        print(f"\n{'='*60}")
+        print(f"TEST RESULTS")
+        print(f"{'='*60}")
+        print(f"Total samples: {total_samples:,}")
+        print(f"Average loss: {avg_loss:.4f}")
+        print(f"Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
+        print(f"Correct predictions: {correct_predictions:,}/{total_samples:,}")
+        
+        # Print top confusions (most common misclassifications)
+        print(f"\nTop 10 Character Confusions:")
+        print(f"{'Actual':<10} {'Predicted':<10} {'Count':<8} {'Actual Char':<12} {'Pred Char'}")
+        print("-" * 60)
+        
+        # Find top confusions (excluding correct predictions)
+        confusion_pairs = []
+        for actual_id in range(char_vocab_size):
+            for pred_id in range(char_vocab_size):
+                if actual_id != pred_id and confusion_matrix[actual_id, pred_id] > 0:
+                    count = confusion_matrix[actual_id, pred_id].item()
+                    actual_char = id_to_char.get(actual_id, f"<id:{actual_id}>")
+                    pred_char = id_to_char.get(pred_id, f"<id:{pred_id}>")
+                    confusion_pairs.append((count, actual_id, pred_id, actual_char, pred_char))
+        
+        confusion_pairs.sort(reverse=True)
+        for i, (count, actual_id, pred_id, actual_char, pred_char) in enumerate(confusion_pairs[:10]):
+            # Escape special characters for display
+            actual_display = repr(actual_char) if actual_char in ['\n', '\t', ' '] else actual_char
+            pred_display = repr(pred_char) if pred_char in ['\n', '\t', ' '] else pred_char
+            print(f"{actual_id:<10} {pred_id:<10} {count:<8} {actual_display:<12} {pred_display}")
+        
+        print(f"{'='*60}")
+    
+    return {
+        'loss': avg_loss,
+        'accuracy': accuracy,
+        'total_samples': total_samples,
+        'correct_predictions': correct_predictions,
+        'confusion_matrix': confusion_matrix
+    }
+
 def model_matches(model, state_dict):
     """Check if the loaded state_dict fits the model structure. Print all mismatches."""
     model_state = model.state_dict()
@@ -656,7 +763,7 @@ def merge_config_args(config, args, provided_args):
     merged = config.copy() if config else {}
     
     # Override with command line args (only explicitly provided values)
-    boolean_flags = ['train', 'predict', 'multi_gpu', 'distributed']
+    boolean_flags = ['train', 'predict', 'test', 'multi_gpu', 'distributed']
     args_dict = vars(args)
     for key, value in args_dict.items():
         if value is not None and key in provided_args:
@@ -676,7 +783,9 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, help="YAML config file path")
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--predict", action="store_true")
+    parser.add_argument("--test", action="store_true", help="Run model evaluation on test data")
     parser.add_argument("--data_dir", type=str, help="Directory containing training data files or single JSON file")
+    parser.add_argument("--test_dir", type=str, help="Directory containing test data files or single JSON file")
     parser.add_argument("--word2vec", type=str, help="Custom word2vec file (.npz, .pkl, .json)")
     parser.add_argument("--epochs", type=int, help="Number of training epochs")
     parser.add_argument("--max_word_len", type=int, help="Maximum word length")
@@ -707,7 +816,7 @@ if __name__ == "__main__":
     
     # Track which boolean args were explicitly provided
     provided_args = set()
-    boolean_flags = ['train', 'predict', 'multi_gpu', 'distributed']
+    boolean_flags = ['train', 'predict', 'test', 'multi_gpu', 'distributed']
     for flag in boolean_flags:
         if f'--{flag}' in sys.argv:
             provided_args.add(flag)
@@ -721,7 +830,9 @@ if __name__ == "__main__":
             # Set defaults
             self.train = kwargs.get('train', False)
             self.predict = kwargs.get('predict', False)
+            self.test = kwargs.get('test', False)
             self.data_dir = kwargs.get('data_dir', 'training_data')
+            self.test_dir = kwargs.get('test_dir')
             self.word2vec = kwargs.get('word2vec')
             self.epochs = kwargs.get('epochs', 3)
             self.max_word_len = kwargs.get('max_word_len', 50)
@@ -744,8 +855,10 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("TRAINING CONFIGURATION")
     print("=" * 60)
-    print(f"Mode: {'Training' if args.train else 'Prediction' if args.predict else 'Unknown'}")
+    print(f"Mode: {'Training' if args.train else 'Prediction' if args.predict else 'Testing' if args.test else 'Unknown'}")
     print(f"Data directory: {args.data_dir}")
+    if args.test:
+        print(f"Test directory: {args.test_dir}")
     print(f"Word2Vec file: {args.word2vec}")
     print(f"Model file: {args.model}")
     print(f"Epochs: {args.epochs}")
@@ -1179,5 +1292,73 @@ if __name__ == "__main__":
             print("\nExiting...")
         
         # Cleanup shared memory on exit
+        if use_shared_memory:
+            cleanup_shared_word2vec()
+        
+    elif args.test:
+        # Validate required args for testing
+        if not args.test_dir:
+            print("Error: --test_dir is required for testing mode")
+            exit(1)
+        
+        # For testing, we need to unwrap the model if it's wrapped in DataParallel or DDP
+        if isinstance(model, (nn.DataParallel, DDP)):
+            model = model.module
+        
+        # Load the model weights
+        print("Loading model for testing...")
+        model.load_state_dict(torch.load(args.model, map_location=device, weights_only=False))
+        model.eval()
+        
+        # Create test dataset
+        print(f"Creating test dataset from {args.test_dir}...")
+        test_dataset = CharGenStreamingDataset(
+            args.test_dir, 
+            w2v_model, 
+            char_to_id,
+            ctx_len=args.ctx_len, 
+            max_word_len=args.max_word_len, 
+            max_gen_len=args.max_gen_len,
+            num_workers=args.num_workers,
+            use_shared_memory=use_shared_memory
+        )
+        
+        # Setup test data loading
+        if is_distributed:
+            workers_per_process = max(1, args.num_workers // max(1, torch.cuda.device_count()))
+            test_dataloader = DataLoader(
+                test_dataset, 
+                batch_size=args.batch_size,
+                num_workers=workers_per_process,
+                pin_memory=True,
+                persistent_workers=True if workers_per_process > 0 else False,
+                prefetch_factor=2,
+                drop_last=False  # Don't drop last batch for testing
+            )
+            print(f"Rank {local_rank}: Test DataLoader created with {workers_per_process} workers per process")
+        else:
+            test_dataloader = DataLoader(
+                test_dataset, 
+                batch_size=args.batch_size, 
+                num_workers=args.num_workers,
+                pin_memory=True,
+                persistent_workers=True,
+                prefetch_factor=2,
+                drop_last=False  # Don't drop last batch for testing
+            )
+            print(f"Test DataLoader created with {args.num_workers} worker processes")
+        
+        # Run the test
+        print("Starting model evaluation...")
+        test_results = test_model(
+            model, 
+            test_dataloader, 
+            char_to_id, 
+            id_to_char,
+            local_rank=local_rank if is_distributed else 0,
+            is_distributed=is_distributed
+        )
+        
+        # Cleanup shared memory after testing
         if use_shared_memory:
             cleanup_shared_word2vec()
