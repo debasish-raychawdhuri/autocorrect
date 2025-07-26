@@ -519,7 +519,8 @@ def train_model(model, dataloader, vocab_size, epochs=3, save_path="char_autocor
                 
                 if not is_distributed or local_rank == 0:
                     if isinstance(loop, tqdm):
-                        loop.set_postfix(loss=loss.item())
+                        current_avg_loss = epoch_loss / batch_count
+                        loop.set_postfix(batch_loss=f"{loss.item():.4f}", avg_loss=f"{current_avg_loss:.4f}")
                 
                 # Check if save was requested (only save on main process)
                 if save_requested[0] and (not is_distributed or local_rank == 0):
@@ -832,7 +833,8 @@ if __name__ == "__main__":
             self.predict = kwargs.get('predict', False)
             self.test = kwargs.get('test', False)
             self.data_dir = kwargs.get('data_dir', 'training_data')
-            self.test_dir = kwargs.get('test_dir')
+            # Handle test_dir - can come from top level or test section
+            self.test_dir = kwargs.get('test_dir') or kwargs.get('test', {}).get('test_dir')
             self.word2vec = kwargs.get('word2vec')
             self.epochs = kwargs.get('epochs', 3)
             self.max_word_len = kwargs.get('max_word_len', 50)
@@ -877,9 +879,10 @@ if __name__ == "__main__":
     print("=" * 60)
     
     # Get user confirmation
-    response = input("Proceed with training? (y/N): ").strip().lower()
+    mode_name = "training" if args.train else "prediction" if args.predict else "testing" if args.test else "operation"
+    response = input(f"Proceed with {mode_name}? (y/N): ").strip().lower()
     if response not in ['y', 'yes']:
-        print("Training cancelled.")
+        print(f"{mode_name.capitalize()} cancelled.")
         exit(0)
     print()
 

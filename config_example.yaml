@@ -1,0 +1,26 @@
+# Example configuration file for autocorrect model
+
+# Training configuration
+train: false
+data_dir: "training_data"
+word2vec: "word2vec_custom.npz" 
+epochs: 5
+batch_size: 8192
+model: "char_autocorrect.onnx"
+
+# Model architecture
+hidden_dim: 1200
+num_layers: 50
+ctx_len: 10
+max_word_len: 50
+max_gen_len: 50
+
+# Testing configuration
+test:
+  test_dir: "test_data"
+
+# Hardware configuration  
+multi_gpu: false
+distributed: false
+num_workers: 16
+mp_start_method: "fork"
