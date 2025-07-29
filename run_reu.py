@@ -763,6 +763,14 @@ def merge_config_args(config, args, provided_args):
     # Start with config defaults
     merged = config.copy() if config else {}
     
+    # If test mode is enabled, merge test-specific config
+    if args.test and config and 'test' in config:
+        test_config = config['test']
+        # Merge test-specific config, but don't override top-level settings
+        for key, value in test_config.items():
+            if key not in merged:  # Only add if not already present at top level
+                merged[key] = value
+    
     # Override with command line args (only explicitly provided values)
     boolean_flags = ['train', 'predict', 'test', 'multi_gpu', 'distributed']
     args_dict = vars(args)
@@ -833,8 +841,7 @@ if __name__ == "__main__":
             self.predict = kwargs.get('predict', False)
             self.test = kwargs.get('test', False)
             self.data_dir = kwargs.get('data_dir', 'training_data')
-            # Handle test_dir - can come from top level or test section
-            self.test_dir = kwargs.get('test_dir') or kwargs.get('test', {}).get('test_dir')
+            self.test_dir = kwargs.get('test_dir')
             self.word2vec = kwargs.get('word2vec')
             self.epochs = kwargs.get('epochs', 3)
             self.max_word_len = kwargs.get('max_word_len', 50)
