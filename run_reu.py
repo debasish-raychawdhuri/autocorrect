@@ -1284,8 +1284,50 @@ if __name__ == "__main__":
         if isinstance(model, (nn.DataParallel, DDP)):
             model = model.module
         
-        # Load the model weights
-        model.load_state_dict(torch.load(args.model, map_location=device, weights_only=False))
+        # Load the model weights based on file format
+        model_format = get_model_format(args.model)
+        if model_format == 'pytorch':
+            model.load_state_dict(torch.load(args.model, map_location=device, weights_only=False))
+        elif model_format == 'onnx':
+            print("ONNX model detected - extracting weights for prediction...")
+            try:
+                import onnx
+                import onnxruntime as ort
+                
+                # Load ONNX model to extract weights
+                onnx_model = onnx.load(args.model)
+                
+                # Get the current model's state dict structure
+                current_state_dict = model.state_dict()
+                
+                # Extract weights from ONNX and map to current model
+                checkpoint = {}
+                
+                for initializer in onnx_model.graph.initializer:
+                    param_name = initializer.name
+                    param_data = onnx.numpy_helper.to_array(initializer)
+                    
+                    # Direct name matching first
+                    if param_name in current_state_dict:
+                        checkpoint[param_name] = torch.from_numpy(param_data.copy())
+                    else:
+                        # Try common ONNX naming patterns
+                        for pytorch_name in current_state_dict.keys():
+                            if param_name.endswith(pytorch_name) or pytorch_name.endswith(param_name):
+                                checkpoint[pytorch_name] = torch.from_numpy(param_data.copy())
+                                break
+                
+                # Load the extracted weights
+                model.load_state_dict(checkpoint)
+                print(f"Successfully loaded {len(checkpoint)} parameters from ONNX model")
+                
+            except ImportError as e:
+                print(f"Missing required library for ONNX loading: {e}")
+                print("Please install: pip install onnx onnxruntime")
+                exit(1)
+            except Exception as e:
+                print(f"Error loading ONNX model: {e}")
+                exit(1)
         model.eval()
         
         print("Interactive prediction mode. Press Ctrl+C to exit.")
@@ -1323,9 +1365,51 @@ if __name__ == "__main__":
         if isinstance(model, (nn.DataParallel, DDP)):
             model = model.module
         
-        # Load the model weights
+        # Load the model weights based on file format
         print("Loading model for testing...")
-        model.load_state_dict(torch.load(args.model, map_location=device, weights_only=False))
+        model_format = get_model_format(args.model)
+        if model_format == 'pytorch':
+            model.load_state_dict(torch.load(args.model, map_location=device, weights_only=False))
+        elif model_format == 'onnx':
+            print("ONNX model detected - extracting weights for testing...")
+            try:
+                import onnx
+                import onnxruntime as ort
+                
+                # Load ONNX model to extract weights
+                onnx_model = onnx.load(args.model)
+                
+                # Get the current model's state dict structure
+                current_state_dict = model.state_dict()
+                
+                # Extract weights from ONNX and map to current model
+                checkpoint = {}
+                
+                for initializer in onnx_model.graph.initializer:
+                    param_name = initializer.name
+                    param_data = onnx.numpy_helper.to_array(initializer)
+                    
+                    # Direct name matching first
+                    if param_name in current_state_dict:
+                        checkpoint[param_name] = torch.from_numpy(param_data.copy())
+                    else:
+                        # Try common ONNX naming patterns
+                        for pytorch_name in current_state_dict.keys():
+                            if param_name.endswith(pytorch_name) or pytorch_name.endswith(param_name):
+                                checkpoint[pytorch_name] = torch.from_numpy(param_data.copy())
+                                break
+                
+                # Load the extracted weights
+                model.load_state_dict(checkpoint)
+                print(f"Successfully loaded {len(checkpoint)} parameters from ONNX model")
+                
+            except ImportError as e:
+                print(f"Missing required library for ONNX loading: {e}")
+                print("Please install: pip install onnx onnxruntime")
+                exit(1)
+            except Exception as e:
+                print(f"Error loading ONNX model: {e}")
+                exit(1)
         model.eval()
         
         # Create test dataset
