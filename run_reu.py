@@ -892,13 +892,13 @@ if __name__ == "__main__":
     print(f"Multiprocessing method: {args.mp_start_method}")
     print("=" * 60)
     
-    # Get user confirmation
-    mode_name = "training" if args.train else "prediction" if args.predict else "testing" if args.test else "operation"
-    response = input(f"Proceed with {mode_name}? (y/N): ").strip().lower()
-    if response not in ['y', 'yes']:
-        print(f"{mode_name.capitalize()} cancelled.")
-        exit(0)
-    print()
+    # Get user confirmation only for training mode
+    if args.train:
+        response = input(f"Proceed with training? (y/N): ").strip().lower()
+        if response not in ['y', 'yes']:
+            print("Training cancelled.")
+            exit(0)
+        print()
 
     # Validate required args
     if not args.word2vec:
