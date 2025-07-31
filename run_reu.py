@@ -867,9 +867,10 @@ if __name__ == "__main__":
     
     args = Config(**merged_config)
     
-    # Print all configuration options for user confirmation
+    # Print all configuration options
+    config_title = "TRAINING CONFIGURATION" if args.train else "PREDICTION CONFIGURATION" if args.predict else "TESTING CONFIGURATION" if args.test else "CONFIGURATION"
     print("\n" + "=" * 60)
-    print("TRAINING CONFIGURATION")
+    print(config_title)
     print("=" * 60)
     print(f"Mode: {'Training' if args.train else 'Prediction' if args.predict else 'Testing' if args.test else 'Unknown'}")
     print(f"Data directory: {args.data_dir}")
