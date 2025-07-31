@@ -763,12 +763,18 @@ def merge_config_args(config, args, provided_args):
     # Start with config defaults
     merged = config.copy() if config else {}
     
+    # Mode flags should never be read from config - they must be explicit command line args
+    mode_flags = ['train', 'predict', 'test']
+    for flag in mode_flags:
+        if flag in merged:
+            del merged[flag]
+    
     # If test mode is enabled, merge test-specific config
     if args.test and config and 'test' in config:
         test_config = config['test']
         # Merge test-specific config, but don't override top-level settings
         for key, value in test_config.items():
-            if key not in merged:  # Only add if not already present at top level
+            if key not in merged and key not in mode_flags:  # Exclude mode flags from test config too
                 merged[key] = value
     
     # Override with command line args (only explicitly provided values)
