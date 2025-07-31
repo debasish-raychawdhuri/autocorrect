@@ -775,7 +775,8 @@ def merge_config_args(config, args, provided_args):
     boolean_flags = ['train', 'predict', 'test', 'multi_gpu', 'distributed']
     args_dict = vars(args)
     for key, value in args_dict.items():
-        if value is not None and key in provided_args:
+        if key in provided_args:
+            # For explicitly provided args (including boolean flags), always override
             merged[key] = value
         elif value is not None and key not in boolean_flags:
             # For non-boolean flags, treat non-None as explicitly provided
