@@ -1,0 +1,44 @@
+# Autocorrect LoRA Training Configuration
+# Use with: 
+#   python prepare_training_samples_generative.py --config lora_training_config.yaml
+#   python run_reu.py --config lora_training_config.yaml
+
+# === Data Generation Parameters ===
+# For prepare_training_samples_generative.py
+infile: "sentences.txt"
+outdir: "training_data"
+multi_files: true
+dataloader_workers: 32  # Number of output files to create
+n_noisy: 10  # Number of misspelled versions per word
+workers: null  # Generation processes (null = auto-detect CPU cores)
+
+# === Training Parameters ===
+# For run_reu.py
+train: true
+data_dir: "training_data"  # Should match outdir above
+word2vec: "word2vec_custom.pkl"
+
+# Model architecture with LoRA
+hidden_dim: 4000
+num_layers: 30
+lora_rank: 200  # Low-rank adaptation rank (None for full-rank)
+model: "autocorrect_lora.onnx"
+
+# Training hyperparameters
+epochs: 3
+batch_size: 16384
+ctx_len: 10
+max_word_len: 50
+max_gen_len: 50
+
+# Data loading
+num_workers: 8  # Should match dataloader_workers above
+mp_start_method: "fork"
+
+# GPU settings
+multi_gpu: false
+distributed: false
+gpu: null  # Use default GPU
+
+# For prediction mode, set train: false and predict: true
+# predict: false
