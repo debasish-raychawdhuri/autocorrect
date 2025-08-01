@@ -255,15 +255,31 @@ def load_config(config_path):
 
 def merge_config_args(config, args, provided_args):
     """Merge config file with command line args, giving priority to command line"""
-    # Start with config defaults
-    merged = config.copy() if config else {}
+    # Start with defaults
+    merged = {
+        'infile': 'sentences.txt',
+        'outfile': 'autogen_char_data.json',
+        'outdir': 'training_data',
+        'dataloader_workers': 8,
+        'ctx_len': 10,
+        'n_noisy': 10,
+        'workers': None,
+        'batch_size': 1000,
+        'multi_files': False
+    }
+    
+    # Override with config file values
+    if config:
+        merged.update(config)
     
     # Override with command line args (only explicitly provided values)
+    boolean_flags = ['multi_files']
     args_dict = vars(args)
     for key, value in args_dict.items():
-        if value is not None and key in provided_args:
+        if key in provided_args:
+            # For explicitly provided args (including boolean flags), always override
             merged[key] = value
-        elif value is not None and key != 'multi_files':
+        elif value is not None and key not in boolean_flags:
             # For non-boolean flags, treat non-None as explicitly provided
             merged[key] = value
     
@@ -291,27 +307,38 @@ if __name__ == "__main__":
     if cmd_args.config:
         config = load_config(cmd_args.config)
         print(f"📄 Loaded config from: {cmd_args.config}")
+        print(f"📄 Config contents: {config}")
     
     # Track which args were explicitly provided
     provided_args = set()
-    if '--multi_files' in sys.argv:
-        provided_args.add('multi_files')
+    boolean_flags = ['multi_files']
+    for flag in boolean_flags:
+        if f'--{flag}' in sys.argv:
+            provided_args.add(flag)
+    
+    # Track other explicitly provided arguments
+    for arg in sys.argv[1:]:
+        if arg.startswith('--') and '=' not in arg:
+            arg_name = arg[2:]  # Remove '--'
+            if arg_name in vars(cmd_args) and arg_name not in boolean_flags:
+                provided_args.add(arg_name)
+        elif arg.startswith('--') and '=' in arg:
+            arg_name = arg[2:].split('=')[0]  # Remove '--' and get part before '='
+            if arg_name in vars(cmd_args):
+                provided_args.add(arg_name)
+    
+    print(f"🔧 Command line args: {vars(cmd_args)}")
+    print(f"🔧 Provided args: {provided_args}")
     
     # Merge config with command line args
     merged_config = merge_config_args(config, cmd_args, provided_args)
+    print(f"🔧 Merged config: {merged_config}")
     
-    # Convert back to object with defaults
+    # Convert to simple object with attribute access
     class Config:
         def __init__(self, **kwargs):
-            self.infile = kwargs.get('infile', 'sentences.txt')
-            self.outfile = kwargs.get('outfile', 'autogen_char_data.json')
-            self.outdir = kwargs.get('outdir', 'training_data')
-            self.dataloader_workers = kwargs.get('dataloader_workers', 8)
-            self.ctx_len = kwargs.get('ctx_len', 10)
-            self.n_noisy = kwargs.get('n_noisy', 10)
-            self.workers = kwargs.get('workers')
-            self.batch_size = kwargs.get('batch_size', 1000)
-            self.multi_files = kwargs.get('multi_files', False)
+            for key, value in kwargs.items():
+                setattr(self, key, value)
     
     args = Config(**merged_config)
     
