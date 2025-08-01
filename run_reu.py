@@ -893,6 +893,7 @@ if __name__ == "__main__":
     if cmd_args.config:
         config = load_config(cmd_args.config)
         print(f"📄 Loaded config from: {cmd_args.config}")
+        print(f"📄 Config contents: {config}")
     
     # Track which boolean args were explicitly provided
     provided_args = set()
@@ -901,8 +902,12 @@ if __name__ == "__main__":
         if f'--{flag}' in sys.argv:
             provided_args.add(flag)
     
+    print(f"🔧 Command line args: {vars(cmd_args)}")
+    print(f"🔧 Provided args: {provided_args}")
+    
     # Merge config with command line args
     merged_config = merge_config_args(config, cmd_args, provided_args)
+    print(f"🔧 Merged config: {merged_config}")
     
     # Convert to simple object with attribute access
     class Config:
