@@ -797,21 +797,47 @@ def load_config(config_path):
 
 def merge_config_args(config, args, provided_args):
     """Merge config file with command line args, giving priority to command line"""
-    # Start with config defaults
-    merged = config.copy() if config else {}
+    # Start with defaults
+    merged = {
+        'train': False,
+        'predict': False,
+        'test': False,
+        'data_dir': 'training_data',
+        'test_dir': None,
+        'word2vec': None,
+        'epochs': 3,
+        'max_word_len': 50,
+        'max_gen_len': 50,
+        'ctx_len': 10,
+        'batch_size': 32,
+        'model': 'char_autocorrect.onnx',
+        'hidden_dim': 600,
+        'num_layers': 30,
+        'lora_rank': None,
+        'multi_gpu': False,
+        'distributed': False,
+        'local_rank': -1,
+        'gpu': None,
+        'num_workers': None,
+        'mp_start_method': 'fork'
+    }
+    
+    # Override with config file values
+    if config:
+        merged.update(config)
     
     # Mode flags should never be read from config - they must be explicit command line args
     mode_flags = ['train', 'predict', 'test']
     for flag in mode_flags:
-        if flag in merged:
-            del merged[flag]
+        if flag in config:
+            merged[flag] = False  # Reset to default, don't delete
     
     # If test mode is enabled, merge test-specific config
     if args.test and config and 'test' in config:
         test_config = config['test']
         # Merge test-specific config, but don't override top-level settings
         for key, value in test_config.items():
-            if key not in merged and key not in mode_flags:  # Exclude mode flags from test config too
+            if key not in mode_flags:  # Exclude mode flags from test config too
                 merged[key] = value
     
     # Override with command line args (only explicitly provided values)
@@ -878,31 +904,11 @@ if __name__ == "__main__":
     # Merge config with command line args
     merged_config = merge_config_args(config, cmd_args, provided_args)
     
-    # Convert back to argparse Namespace with defaults
+    # Convert to simple object with attribute access
     class Config:
         def __init__(self, **kwargs):
-            # Set defaults
-            self.train = kwargs.get('train', False)
-            self.predict = kwargs.get('predict', False)
-            self.test = kwargs.get('test', False)
-            self.data_dir = kwargs.get('data_dir', 'training_data')
-            self.test_dir = kwargs.get('test_dir')
-            self.word2vec = kwargs.get('word2vec')
-            self.epochs = kwargs.get('epochs', 3)
-            self.max_word_len = kwargs.get('max_word_len', 50)
-            self.max_gen_len = kwargs.get('max_gen_len', 50)
-            self.ctx_len = kwargs.get('ctx_len', 10)
-            self.batch_size = kwargs.get('batch_size', 32)
-            self.model = kwargs.get('model', 'char_autocorrect.onnx')
-            self.hidden_dim = kwargs.get('hidden_dim', 600)
-            self.num_layers = kwargs.get('num_layers', 30)
-            self.lora_rank = kwargs.get('lora_rank')
-            self.multi_gpu = kwargs.get('multi_gpu', False)
-            self.distributed = kwargs.get('distributed', False)
-            self.local_rank = kwargs.get('local_rank', -1)
-            self.gpu = kwargs.get('gpu')
-            self.num_workers = kwargs.get('num_workers')
-            self.mp_start_method = kwargs.get('mp_start_method', 'fork')
+            for key, value in kwargs.items():
+                setattr(self, key, value)
     
     args = Config(**merged_config)
     
