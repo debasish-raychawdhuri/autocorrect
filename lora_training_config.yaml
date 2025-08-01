@@ -9,7 +9,7 @@ infile: "wiki_sentences.txt"
 outdir: "training_data"
 multi_files: true
 dataloader_workers: 32  # Number of output files to create
-n_noisy: 10  # Number of misspelled versions per word
+n_noisy: 5  # Number of misspelled versions per word
 workers: null  # Generation processes (null = auto-detect CPU cores)
 
 # === Training Parameters ===
