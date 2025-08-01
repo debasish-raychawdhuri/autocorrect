@@ -5,7 +5,7 @@
 
 # === Data Generation Parameters ===
 # For prepare_training_samples_generative.py
-infile: "sentences.txt"
+infile: "wiki_sentences.txt"
 outdir: "training_data"
 multi_files: true
 dataloader_workers: 32  # Number of output files to create
@@ -32,7 +32,7 @@ max_word_len: 50
 max_gen_len: 50
 
 # Data loading
-num_workers: 8  # Should match dataloader_workers above
+num_workers: 32 # Should match dataloader_workers above
 mp_start_method: "fork"
 
 # GPU settings
