@@ -354,19 +354,56 @@ class CharGenStreamingDataset(IterableDataset):
 
 # ---- Model ----
 
+class LoRALinear(nn.Module):
+    """Low-Rank Linear Layer: W = A @ B where A is (in_features, rank) and B is (rank, out_features)"""
+    def __init__(self, in_features, out_features, rank=None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        
+        if rank is None or rank >= min(in_features, out_features):
+            # Use full-rank layer if rank is None or too large
+            self.use_lora = False
+            self.linear = nn.Linear(in_features, out_features)
+        else:
+            # Use low-rank decomposition: W = A @ B
+            self.use_lora = True
+            self.lora_A = nn.Linear(in_features, rank, bias=False)  # Down-projection
+            self.lora_B = nn.Linear(rank, out_features)  # Up-projection (includes bias)
+            
+            # Initialize weights
+            nn.init.kaiming_uniform_(self.lora_A.weight, a=5**0.5)
+            nn.init.kaiming_uniform_(self.lora_B.weight, a=5**0.5)
+    
+    def forward(self, x):
+        if not self.use_lora:
+            return self.linear(x)
+        
+        # Low-rank transformation: x -> A -> B
+        return self.lora_B(self.lora_A(x))
+
 class ResNetFFN(nn.Module):
-    def __init__(self, context_dim, word_onehot_dim, gen_onehot_dim, char_vocab_size, hidden_dim=600, num_layers=20):
+    def __init__(self, context_dim, word_onehot_dim, gen_onehot_dim, char_vocab_size, 
+                 hidden_dim=600, num_layers=20, lora_rank=None):
         super().__init__()
         input_dim = context_dim + word_onehot_dim + gen_onehot_dim
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.lora_rank = lora_rank
+        
+        # Input projection layer
+        self.input_proj = LoRALinear(input_dim, hidden_dim, rank=lora_rank)
+        
+        # Hidden layers with LoRA support
         self.layers = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
+                LoRALinear(hidden_dim, hidden_dim, rank=lora_rank),
                 nn.LayerNorm(hidden_dim),
                 BiReLU()
             ) for _ in range(num_layers)
         ])
-        self.output_layer = nn.Linear(hidden_dim, char_vocab_size)
+        
+        # Output layer
+        self.output_layer = LoRALinear(hidden_dim, char_vocab_size, rank=lora_rank)
 
     def forward(self, context_vec, misspelled_oh, prefix_oh):
         x = torch.cat([context_vec, misspelled_oh, prefix_oh], dim=1)
@@ -812,6 +849,7 @@ if __name__ == "__main__":
     # Add model architecture arguments
     parser.add_argument("--hidden_dim", type=int, help="Hidden layer width")
     parser.add_argument("--num_layers", type=int, help="Number of hidden layers")
+    parser.add_argument("--lora_rank", type=int, help="LoRA rank for low-rank decomposition (None for full-rank)")
     # Add multi-GPU arguments
     parser.add_argument("--multi_gpu", action="store_true", help="Use multiple GPUs with DataParallel")
     parser.add_argument("--distributed", action="store_true", help="Use DistributedDataParallel for multi-GPU training")
@@ -858,6 +896,7 @@ if __name__ == "__main__":
             self.model = kwargs.get('model', 'char_autocorrect.onnx')
             self.hidden_dim = kwargs.get('hidden_dim', 600)
             self.num_layers = kwargs.get('num_layers', 30)
+            self.lora_rank = kwargs.get('lora_rank')
             self.multi_gpu = kwargs.get('multi_gpu', False)
             self.distributed = kwargs.get('distributed', False)
             self.local_rank = kwargs.get('local_rank', -1)
@@ -885,6 +924,7 @@ if __name__ == "__main__":
     print(f"Batch size: {args.batch_size}")
     print(f"Hidden dimensions: {args.hidden_dim}")
     print(f"Number of layers: {args.num_layers}")
+    print(f"LoRA rank: {args.lora_rank if args.lora_rank else 'Full-rank (disabled)'}")
     print(f"Multi-GPU: {args.multi_gpu}")
     print(f"Distributed: {args.distributed}")
     print(f"GPU: {args.gpu}")
@@ -1028,7 +1068,8 @@ if __name__ == "__main__":
         gen_onehot_dim=gen_onehot_dim,
         char_vocab_size=char_vocab_size,
         hidden_dim=args.hidden_dim,
-        num_layers=args.num_layers
+        num_layers=args.num_layers,
+        lora_rank=args.lora_rank
     ).to(device)
 
     # Wrap model for multi-GPU training with fallback strategy
