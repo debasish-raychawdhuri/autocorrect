@@ -453,14 +453,14 @@ def save_model_to_onnx(model, onnx_path, context_shape, misspelled_shape, prefix
     dummy_misspelled = torch.randn(misspelled_shape).to(next(model.parameters()).device)
     dummy_prefix = torch.randn(prefix_shape).to(next(model.parameters()).device)
     
-    # Export to ONNX
+    # Export to ONNX - disable constant folding to preserve LoRA structure
     torch.onnx.export(
         model,
         (dummy_context, dummy_misspelled, dummy_prefix),
         onnx_path,
         export_params=True,
         opset_version=11,
-        do_constant_folding=True,
+        do_constant_folding=False,  # Don't fuse LoRA matrices
         input_names=['context_vec', 'misspelled_oh', 'prefix_oh'],
         output_names=['logits'],
         dynamic_axes={
@@ -853,6 +853,76 @@ def merge_config_args(config, args, provided_args):
     
     return merged
 
+def decompose_onnx_to_lora(onnx_weights, current_state_dict, checkpoint, lora_rank):
+    """Decompose full-rank ONNX weights into LoRA A,B matrices using SVD - fallback for old saves"""
+    print("Decomposing full-rank ONNX weights into LoRA matrices using SVD...")
+    
+    # Map ONNX parameter names to LoRA parameter patterns
+    for current_param_name in current_state_dict.keys():
+        if '.lora_A.weight' in current_param_name:
+            # Find corresponding full-rank weight in ONNX
+            base_name = current_param_name.replace('.lora_A.weight', '')
+            onnx_weight_name = None
+            
+            # Try different ONNX naming patterns
+            for onnx_name in onnx_weights.keys():
+                if base_name in onnx_name and 'weight' in onnx_name and 'bias' not in onnx_name:
+                    onnx_weight_name = onnx_name
+                    break
+            
+            if onnx_weight_name is not None:
+                full_weight = onnx_weights[onnx_weight_name]  # Shape: [out_features, in_features]
+                
+                # Perform SVD decomposition: W = U @ S @ V^T ≈ (U @ S_reduced) @ V_reduced^T
+                U, S, V = torch.svd(full_weight)
+                
+                # Take top lora_rank components
+                U_reduced = U[:, :lora_rank]  # [out_features, rank]
+                S_reduced = S[:lora_rank]     # [rank]
+                V_reduced = V[:, :lora_rank]  # [in_features, rank]
+                
+                # Distribute singular values: A gets sqrt(S), B gets sqrt(S)
+                sqrt_s = torch.sqrt(S_reduced)
+                
+                # lora_A: [in_features, rank] - down projection
+                lora_A_weight = V_reduced * sqrt_s.unsqueeze(0)  # [in_features, rank]
+                
+                # lora_B: [rank, out_features] - up projection  
+                lora_B_weight = (U_reduced * sqrt_s.unsqueeze(0)).t()  # [rank, out_features]
+                
+                # Store in checkpoint
+                checkpoint[current_param_name] = lora_A_weight.t()  # Transpose to match Linear layer weight format
+                
+                # Find corresponding lora_B parameter
+                lora_B_name = current_param_name.replace('.lora_A.weight', '.lora_B.weight')
+                if lora_B_name in current_state_dict:
+                    checkpoint[lora_B_name] = lora_B_weight
+                
+                print(f"Decomposed {onnx_weight_name} ({full_weight.shape}) -> {current_param_name} + {lora_B_name}")
+        
+        elif '.lora_B.bias' in current_param_name:
+            # Handle bias terms - find corresponding ONNX bias
+            base_name = current_param_name.replace('.lora_B.bias', '')
+            onnx_bias_name = None
+            
+            for onnx_name in onnx_weights.keys():
+                if base_name in onnx_name and 'bias' in onnx_name:
+                    onnx_bias_name = onnx_name
+                    break
+            
+            if onnx_bias_name is not None:
+                checkpoint[current_param_name] = onnx_weights[onnx_bias_name]
+                print(f"Mapped bias {onnx_bias_name} -> {current_param_name}")
+        
+        elif not any(lora_key in current_param_name for lora_key in ['.lora_A.', '.lora_B.']):
+            # Handle non-LoRA parameters (embeddings, etc.) - direct mapping
+            for onnx_name, onnx_weight in onnx_weights.items():
+                if current_param_name in onnx_name or onnx_name.endswith(current_param_name):
+                    checkpoint[current_param_name] = onnx_weight
+                    print(f"Direct mapping {onnx_name} -> {current_param_name}")
+                    break
+
+
 if __name__ == "__main__":
     # Set multiprocessing start method
     import multiprocessing as mp
@@ -1181,32 +1251,80 @@ if __name__ == "__main__":
                         
                         # Extract weights from ONNX and map to current model
                         checkpoint = {}
+                        onnx_weights = {}
                         
                         # Get ONNX initializers (weights and biases)
                         print(f"ONNX file contains {len(onnx_model.graph.initializer)} initializers")
                         print(f"Current model has {len(current_state_dict)} parameters")
                         
+                        # First pass: collect all ONNX weights
                         for initializer in onnx_model.graph.initializer:
                             param_name = initializer.name
                             param_data = onnx.numpy_helper.to_array(initializer)
-                            
+                            onnx_weights[param_name] = torch.from_numpy(param_data.copy())
+                        
+                        # Second pass: map ONNX parameters to current model parameters
+                        # Try direct parameter mapping first
+                        for param_name, param_data in onnx_weights.items():
                             # Direct name matching first
                             if param_name in current_state_dict:
-                                checkpoint[param_name] = torch.from_numpy(param_data.copy())
+                                checkpoint[param_name] = param_data
                             else:
                                 # Try common ONNX naming patterns
                                 for pytorch_name in current_state_dict.keys():
                                     if param_name.endswith(pytorch_name) or pytorch_name.endswith(param_name):
-                                        checkpoint[pytorch_name] = torch.from_numpy(param_data.copy())
+                                        checkpoint[pytorch_name] = param_data
                                         break
                                 else:
                                     print(f"ONNX parameter '{param_name}' not matched to any model parameter")
                         
-                        # Strict parameter matching - must have exact same parameters
-                        if len(checkpoint) != len(current_state_dict):
-                            print(f"ONNX parameter count mismatch: {len(checkpoint)} vs {len(current_state_dict)} expected")
-                            print("Model architecture has changed. Cannot resume training.")
-                            exit(1)
+                        # Parameter count validation
+                        expected_param_count = len(current_state_dict)
+                        actual_param_count = len(checkpoint)
+                        
+                        if actual_param_count != expected_param_count:
+                            print(f"Direct parameter mapping failed: {actual_param_count} loaded vs {expected_param_count} expected")
+                            
+                            if args.lora_rank is not None and actual_param_count < expected_param_count:
+                                print("Attempting SVD decomposition fallback for old full-rank ONNX saves...")
+                                checkpoint.clear()  # Clear failed direct mapping
+                                decompose_onnx_to_lora(onnx_weights, current_state_dict, checkpoint, args.lora_rank)
+                                
+                                # Re-validate after decomposition
+                                actual_param_count = len(checkpoint)
+                                if actual_param_count != expected_param_count:
+                                    print(f"SVD decomposition also failed: {actual_param_count} vs {expected_param_count} expected")
+                                    print("Cannot resume training.")
+                                    exit(1)
+                                else:
+                                    print(f"Successfully decomposed ONNX weights to {actual_param_count} LoRA parameters")
+                                    
+                                    # Verify LoRA matrix dimensions match original weights
+                                    print("Verifying LoRA matrix dimensions...")
+                                    for param_name in current_state_dict.keys():
+                                        if '.lora_A.weight' in param_name:
+                                            base_name = param_name.replace('.lora_A.weight', '')
+                                            lora_B_name = param_name.replace('.lora_A.weight', '.lora_B.weight')
+                                            
+                                            if lora_B_name in checkpoint:
+                                                A_shape = checkpoint[param_name].shape  # [in_features, rank]
+                                                B_shape = checkpoint[lora_B_name].shape  # [rank, out_features]
+                                                expected_full_shape = (B_shape[1], A_shape[0])  # [out_features, in_features]
+                                                
+                                                # Find original ONNX weight to compare dimensions
+                                                for onnx_name, onnx_weight in onnx_weights.items():
+                                                    if base_name in onnx_name and 'weight' in onnx_name and 'bias' not in onnx_name:
+                                                        if onnx_weight.shape != expected_full_shape:
+                                                            print(f"Dimension mismatch for {base_name}: LoRA would reconstruct {expected_full_shape}, but ONNX has {onnx_weight.shape}")
+                                                            print("SVD decomposition dimension validation failed.")
+                                                            exit(1)
+                                                        break
+                                    print("LoRA dimension validation passed.")
+                            else:
+                                print("Model architecture has changed. Cannot resume training.")
+                                exit(1)
+                        else:
+                            print(f"Successfully loaded {actual_param_count} parameters from ONNX model")
                         
                         # Check that all expected parameters are present
                         missing_params = set(current_state_dict.keys()) - set(checkpoint.keys())
