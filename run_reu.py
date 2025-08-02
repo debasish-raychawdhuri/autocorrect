@@ -1323,11 +1323,14 @@ if __name__ == "__main__":
                             
                             print(f"Attempting shape-based matching for {len(unmapped_onnx)} unmapped ONNX parameters...")
                             for current_name, current_tensor in unmapped_current.items():
-                                target_shape = current_tensor.shape
-                                for onnx_name, onnx_tensor in unmapped_onnx.items():
-                                    if onnx_tensor.shape == target_shape:
-                                        checkpoint[current_name] = onnx_tensor
-                                        print(f"Shape match: {onnx_name} {onnx_tensor.shape} -> {current_name}")
+                                target_shape = current_tensor.shape  # e.g., (200, 4000) or (200, 13000)
+                                transposed_shape = (target_shape[1], target_shape[0])  # e.g., (4000, 200) or (13000, 200)
+                                
+                                for onnx_name, onnx_tensor in list(unmapped_onnx.items()):
+                                    if onnx_tensor.shape == transposed_shape:
+                                        # ONNX has transposed lora_A weights - transpose them back
+                                        checkpoint[current_name] = onnx_tensor.t()  # Transpose back to correct shape
+                                        print(f"Shape match (transposed): {onnx_name} {onnx_tensor.shape} -> {current_name} {target_shape}")
                                         del unmapped_onnx[onnx_name]
                                         break
                         
