@@ -866,7 +866,8 @@ def decompose_onnx_to_lora(onnx_weights, current_state_dict, checkpoint, lora_ra
             
             # Try different ONNX naming patterns
             for onnx_name in onnx_weights.keys():
-                if base_name in onnx_name and 'weight' in onnx_name and 'bias' not in onnx_name:
+                # Look for the original linear layer name (without .lora_A/.lora_B)
+                if onnx_name == f"{base_name}.weight" or (base_name in onnx_name and 'weight' in onnx_name and 'bias' not in onnx_name and 'lora' not in onnx_name):
                     onnx_weight_name = onnx_name
                     break
             
@@ -908,7 +909,8 @@ def decompose_onnx_to_lora(onnx_weights, current_state_dict, checkpoint, lora_ra
             onnx_bias_name = None
             
             for onnx_name in onnx_weights.keys():
-                if base_name in onnx_name and 'bias' in onnx_name:
+                # Look for the original linear layer bias (without .lora_A/.lora_B)
+                if onnx_name == f"{base_name}.bias" or (base_name in onnx_name and 'bias' in onnx_name and 'lora' not in onnx_name):
                     onnx_bias_name = onnx_name
                     break
             
