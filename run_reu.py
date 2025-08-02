@@ -1314,6 +1314,23 @@ if __name__ == "__main__":
                                 else:
                                     print(f"ONNX parameter '{param_name}' not matched to any model parameter")
                         
+                        # For LoRA models, handle unmapped onnx::MatMul_xxx parameters by shape matching
+                        if args.lora_rank is not None:
+                            unmapped_onnx = {name: tensor for name, tensor in onnx_weights.items() 
+                                           if name.startswith('onnx::') and name not in checkpoint}
+                            unmapped_current = {name: tensor for name, tensor in current_state_dict.items() 
+                                              if name not in checkpoint and '.lora_A.weight' in name}
+                            
+                            print(f"Attempting shape-based matching for {len(unmapped_onnx)} unmapped ONNX parameters...")
+                            for current_name, current_tensor in unmapped_current.items():
+                                target_shape = current_tensor.shape
+                                for onnx_name, onnx_tensor in unmapped_onnx.items():
+                                    if onnx_tensor.shape == target_shape:
+                                        checkpoint[current_name] = onnx_tensor
+                                        print(f"Shape match: {onnx_name} {onnx_tensor.shape} -> {current_name}")
+                                        del unmapped_onnx[onnx_name]
+                                        break
+                        
                         # Parameter count validation
                         expected_param_count = len(current_state_dict)
                         actual_param_count = len(checkpoint)
