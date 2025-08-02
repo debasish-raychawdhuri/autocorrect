@@ -884,14 +884,16 @@ def decompose_onnx_to_lora(onnx_weights, current_state_dict, checkpoint, lora_ra
                 # Distribute singular values: A gets sqrt(S), B gets sqrt(S)
                 sqrt_s = torch.sqrt(S_reduced)
                 
-                # lora_A: [in_features, rank] - down projection
-                lora_A_weight = V_reduced * sqrt_s.unsqueeze(0)  # [in_features, rank]
+                # lora_A: nn.Linear(in_features, rank) has weight shape [rank, in_features]
+                # A = sqrt(S) * V^T[:rank, :] 
+                lora_A_weight = sqrt_s.unsqueeze(1) * V_reduced.t()  # [rank, in_features]
                 
-                # lora_B: [rank, out_features] - up projection  
-                lora_B_weight = (U_reduced * sqrt_s.unsqueeze(0)).t()  # [rank, out_features]
+                # lora_B: nn.Linear(rank, out_features) has weight shape [out_features, rank] 
+                # B = U[:, :rank] * sqrt(S)
+                lora_B_weight = U_reduced * sqrt_s.unsqueeze(0)  # [out_features, rank]
                 
-                # Store in checkpoint
-                checkpoint[current_param_name] = lora_A_weight.t()  # Transpose to match Linear layer weight format
+                # Store in checkpoint with correct shapes
+                checkpoint[current_param_name] = lora_A_weight  # [rank, in_features]
                 
                 # Find corresponding lora_B parameter
                 lora_B_name = current_param_name.replace('.lora_A.weight', '.lora_B.weight')
