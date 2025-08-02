@@ -857,6 +857,21 @@ def decompose_onnx_to_lora(onnx_weights, current_state_dict, checkpoint, lora_ra
     """Decompose full-rank ONNX weights into LoRA A,B matrices using SVD - fallback for old saves"""
     print("Decomposing full-rank ONNX weights into LoRA matrices using SVD...")
     
+    # Debug: show first few ONNX parameter names and shapes
+    print("ONNX parameters (first 10):")
+    for i, (name, tensor) in enumerate(onnx_weights.items()):
+        if i < 10:
+            print(f"  {name}: {tensor.shape}")
+    
+    # Debug: show first few current model parameter names and expected shapes
+    print("Current model parameters (first 10):")
+    for i, (name, tensor) in enumerate(current_state_dict.items()):
+        if i < 10:
+            print(f"  {name}: {tensor.shape}")
+    
+    # Create a list of unmapped ONNX weights (for shape-based matching)
+    unmapped_onnx_weights = dict(onnx_weights)
+    
     # Map ONNX parameter names to LoRA parameter patterns
     for current_param_name in current_state_dict.keys():
         if '.lora_A.weight' in current_param_name:
@@ -864,12 +879,29 @@ def decompose_onnx_to_lora(onnx_weights, current_state_dict, checkpoint, lora_ra
             base_name = current_param_name.replace('.lora_A.weight', '')
             onnx_weight_name = None
             
-            # Try different ONNX naming patterns
+            # First try name-based matching
             for onnx_name in onnx_weights.keys():
                 # Look for the original linear layer name (without .lora_A/.lora_B)
                 if onnx_name == f"{base_name}.weight" or (base_name in onnx_name and 'weight' in onnx_name and 'bias' not in onnx_name and 'lora' not in onnx_name):
                     onnx_weight_name = onnx_name
                     break
+            
+            # If name-based matching failed, try shape-based matching
+            if onnx_weight_name is None:
+                # Get expected full weight shape from LoRA A,B dimensions
+                lora_B_name = current_param_name.replace('.lora_A.weight', '.lora_B.weight')
+                if lora_B_name in current_state_dict:
+                    expected_A_shape = current_state_dict[current_param_name].shape  # [rank, in_features]
+                    expected_B_shape = current_state_dict[lora_B_name].shape  # [out_features, rank]
+                    expected_full_shape = (expected_B_shape[0], expected_A_shape[1])  # [out_features, in_features]
+                    
+                    # Find ONNX weight with matching shape
+                    for onnx_name, onnx_weight in unmapped_onnx_weights.items():
+                        if onnx_weight.shape == expected_full_shape:
+                            onnx_weight_name = onnx_name
+                            del unmapped_onnx_weights[onnx_name]  # Mark as used
+                            print(f"Shape-based match: {onnx_name} {onnx_weight.shape} -> {base_name}")
+                            break
             
             if onnx_weight_name is not None:
                 full_weight = onnx_weights[onnx_weight_name]  # Shape: [out_features, in_features]
