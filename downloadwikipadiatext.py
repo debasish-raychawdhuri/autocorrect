@@ -1,7 +1,7 @@
 import re
 import os
 import random
-from datasets import load_dataset, get_dataset_config_info
+from datasets import load_dataset
 from tqdm.auto import tqdm
 
 # ... (clean_wikipedia_text function remains the same as before) ...
@@ -63,36 +63,22 @@ def download_and_clean_wikipedia(target_gb=5, output_filename="clean_wikipedia_d
     # We can add a more recent one for future proofing if it becomes available.
     preferred_snapshots = ["20240301.en", "20231101.en", "20230901.en"] # Add other plausible recent dates if known
 
+    # Try snapshots in order until one works
     selected_snapshot = None
-    # Check available configs dynamically for a more robust approach
-    try:
-        config_info = get_dataset_config_info("wikimedia/wikipedia")
-        available_configs = list(config_info.keys())
-        print(f"Checking for available snapshots for 'wikimedia/wikipedia'. Total available: {len(available_configs)}")
-
-        for snapshot_candidate in preferred_snapshots:
-            if snapshot_candidate in available_configs:
-                selected_snapshot = snapshot_candidate
-                print(f"Found and selected snapshot: {selected_snapshot}")
-                break
-        
-        if selected_snapshot is None:
-            # Fallback if preferred snapshots not found, try to find *any* English snapshot
-            print("Preferred English snapshots not found. Searching for any available English snapshot...")
-            for config in available_configs:
-                if config.endswith(".en"):
-                    selected_snapshot = config
-                    print(f"Found and selected fallback English snapshot: {selected_snapshot}")
-                    break
-        
-        if selected_snapshot is None:
-            raise ValueError(f"No English snapshot found for 'wikimedia/wikipedia' dataset. Available configs: {available_configs}")
-
-    except Exception as e:
-        print(f"Error checking dataset configurations: {e}")
-        print("Please ensure 'datasets' library is up to date and you have internet access.")
-        print("Falling back to a hardcoded snapshot if dynamic check fails or no internet.")
-        selected_snapshot = "20231101.en" # Fallback to a known good one from the error message
+    for snapshot_candidate in preferred_snapshots:
+        try:
+            # Test if this snapshot works by trying to load the dataset builder
+            from datasets import load_dataset_builder
+            load_dataset_builder("wikimedia/wikipedia", snapshot_candidate)
+            selected_snapshot = snapshot_candidate
+            print(f"Found and selected snapshot: {selected_snapshot}")
+            break
+        except:
+            continue
+    
+    if selected_snapshot is None:
+        print("All preferred snapshots failed. Using fallback snapshot.")
+        selected_snapshot = "20231101.en"
 
     try:
         # Load the selected Wikipedia snapshot
