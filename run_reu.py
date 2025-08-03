@@ -453,7 +453,7 @@ def save_model_to_onnx(model, onnx_path, context_shape, misspelled_shape, prefix
     dummy_misspelled = torch.randn(misspelled_shape).to(next(model.parameters()).device)
     dummy_prefix = torch.randn(prefix_shape).to(next(model.parameters()).device)
     
-    # Export to ONNX - disable constant folding to preserve LoRA structure
+    # Export to ONNX - preserve parameter names and LoRA structure
     torch.onnx.export(
         model,
         (dummy_context, dummy_misspelled, dummy_prefix),
@@ -461,6 +461,7 @@ def save_model_to_onnx(model, onnx_path, context_shape, misspelled_shape, prefix
         export_params=True,
         opset_version=11,
         do_constant_folding=False,  # Don't fuse LoRA matrices
+        keep_initializers_as_inputs=True,  # Preserve parameter names
         input_names=['context_vec', 'misspelled_oh', 'prefix_oh'],
         output_names=['logits'],
         dynamic_axes={
@@ -656,7 +657,7 @@ def predict_word(model, w2v_model, char_to_id, id_to_char, context_words, misspe
         
         return results[:10]
 
-def test_model(model, dataloader, char_to_id, id_to_char, local_rank=0, is_distributed=False):
+def test_model(model, dataloader, char_to_id, id_to_char, local_rank=0, is_distributed=False, total_samples=None, batch_size=32):
     """Evaluate model on test data and compute accuracy, loss, and confusion matrix"""
     model.eval()
     total_loss = 0.0
@@ -669,7 +670,9 @@ def test_model(model, dataloader, char_to_id, id_to_char, local_rank=0, is_distr
     
     # Use tqdm only on main process if distributed
     if not is_distributed or local_rank == 0:
-        loop = tqdm(dataloader, desc="Testing", unit="batch")
+        # Calculate total batches if we have total_samples
+        total_batches = total_samples // batch_size if total_samples else None
+        loop = tqdm(dataloader, desc="Testing", unit="batch", total=total_batches)
     else:
         loop = dataloader
     
@@ -1684,7 +1687,9 @@ if __name__ == "__main__":
             char_to_id, 
             id_to_char,
             local_rank=local_rank if is_distributed else 0,
-            is_distributed=is_distributed
+            is_distributed=is_distributed,
+            total_samples=getattr(test_dataset, 'total_samples', None),
+            batch_size=args.batch_size
         )
         
         # Cleanup shared memory after testing
