@@ -1531,20 +1531,36 @@ if __name__ == "__main__":
                 
                 # Extract weights from ONNX and map to current model
                 checkpoint = {}
+                onnx_weights = {}
                 
+                # First pass: collect all ONNX weights
                 for initializer in onnx_model.graph.initializer:
                     param_name = initializer.name
                     param_data = onnx.numpy_helper.to_array(initializer)
-                    
+                    onnx_weights[param_name] = torch.from_numpy(param_data.copy())
+                
+                # Second pass: map to current model parameters
+                for param_name in current_state_dict.keys():
                     # Direct name matching first
-                    if param_name in current_state_dict:
-                        checkpoint[param_name] = torch.from_numpy(param_data.copy())
+                    if param_name in onnx_weights:
+                        checkpoint[param_name] = onnx_weights[param_name]
                     else:
                         # Try common ONNX naming patterns
-                        for pytorch_name in current_state_dict.keys():
-                            if param_name.endswith(pytorch_name) or pytorch_name.endswith(param_name):
-                                checkpoint[pytorch_name] = torch.from_numpy(param_data.copy())
+                        for onnx_name in onnx_weights.keys():
+                            if param_name in onnx_name or onnx_name.endswith(param_name):
+                                checkpoint[param_name] = onnx_weights[onnx_name]
                                 break
+                
+                # If we still don't have all parameters, this might be architecture mismatch
+                if len(checkpoint) != len(current_state_dict):
+                    print(f"Parameter count mismatch: found {len(checkpoint)}, expected {len(current_state_dict)}")
+                    print("Current model parameters:")
+                    for name in sorted(current_state_dict.keys())[:10]:
+                        print(f"  {name}")
+                    print("ONNX parameters:")
+                    for name in sorted(onnx_weights.keys())[:10]:
+                        print(f"  {name}")
+                    raise ValueError("Model architecture mismatch - ONNX model structure doesn't match current configuration")
                 
                 # Load the extracted weights
                 model.load_state_dict(checkpoint)
@@ -1613,20 +1629,36 @@ if __name__ == "__main__":
                 
                 # Extract weights from ONNX and map to current model
                 checkpoint = {}
+                onnx_weights = {}
                 
+                # First pass: collect all ONNX weights
                 for initializer in onnx_model.graph.initializer:
                     param_name = initializer.name
                     param_data = onnx.numpy_helper.to_array(initializer)
-                    
+                    onnx_weights[param_name] = torch.from_numpy(param_data.copy())
+                
+                # Second pass: map to current model parameters
+                for param_name in current_state_dict.keys():
                     # Direct name matching first
-                    if param_name in current_state_dict:
-                        checkpoint[param_name] = torch.from_numpy(param_data.copy())
+                    if param_name in onnx_weights:
+                        checkpoint[param_name] = onnx_weights[param_name]
                     else:
                         # Try common ONNX naming patterns
-                        for pytorch_name in current_state_dict.keys():
-                            if param_name.endswith(pytorch_name) or pytorch_name.endswith(param_name):
-                                checkpoint[pytorch_name] = torch.from_numpy(param_data.copy())
+                        for onnx_name in onnx_weights.keys():
+                            if param_name in onnx_name or onnx_name.endswith(param_name):
+                                checkpoint[param_name] = onnx_weights[onnx_name]
                                 break
+                
+                # If we still don't have all parameters, this might be architecture mismatch
+                if len(checkpoint) != len(current_state_dict):
+                    print(f"Parameter count mismatch: found {len(checkpoint)}, expected {len(current_state_dict)}")
+                    print("Current model parameters:")
+                    for name in sorted(current_state_dict.keys())[:10]:
+                        print(f"  {name}")
+                    print("ONNX parameters:")
+                    for name in sorted(onnx_weights.keys())[:10]:
+                        print(f"  {name}")
+                    raise ValueError("Model architecture mismatch - ONNX model structure doesn't match current configuration")
                 
                 # Load the extracted weights
                 model.load_state_dict(checkpoint)
