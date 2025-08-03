@@ -81,29 +81,65 @@ def download_and_clean_wikipedia(target_gb=5, output_filename="clean_wikipedia_d
         selected_snapshot = "20231101.en"
 
     try:
-        # Load the selected Wikipedia snapshot
-        dataset = load_dataset("wikimedia/wikipedia", selected_snapshot, split="train", streaming=True)
-
-        print(f"Loading wikimedia/wikipedia dataset ('{selected_snapshot}' snapshot) in streaming mode...")
+        # Download and process Wikipedia XML dumps directly
+        import urllib.request
+        import bz2
+        import xml.etree.ElementTree as ET
+        
+        # Try multiple dump files until we reach target size
+        dump_files = [
+            "enwiki-latest-pages-articles1.xml-p1p41242.bz2",
+            "enwiki-latest-pages-articles2.xml-p41243p151573.bz2",
+            "enwiki-latest-pages-articles3.xml-p151574p311329.bz2"
+        ]
+        
+        print(f"Downloading and processing Wikipedia dumps directly...")
+        
         with open(output_filename, "w", encoding="utf-8") as f:
-            for example in tqdm(dataset, desc="Processing Wikipedia articles"):
-                page_text = example['text']
-
-                cleaned_text = clean_wikipedia_text(page_text)
-                if random.randint(0, 100) < 10:
-                    continue
-
-                if len(cleaned_text) < 100:
-                    continue
-
-                f.write(cleaned_text + "\n\n")
-                current_size = os.path.getsize(output_filename)
-                num_pages += 1
-
-                if current_size >= TARGET_SIZE_BYTES:
-                    print(f"\nTarget size reached: {current_size / (1024**3):.2f} GB.")
-                    print(f"Total clean articles processed: {num_pages}")
+            for dump_file in dump_files:
+                if os.path.getsize(output_filename) >= TARGET_SIZE_BYTES:
                     break
+                    
+                print(f"Downloading {dump_file}...")
+                urllib.request.urlretrieve(f"https://dumps.wikimedia.org/enwiki/latest/{dump_file}", dump_file)
+                
+                print(f"Processing {dump_file}...")
+                with bz2.open(dump_file, 'rt', encoding='utf-8') as xml_file:
+                    current_text = ""
+                    in_text = False
+                    
+                    for line in tqdm(xml_file, desc=f"Processing {dump_file}"):
+                        if '<text' in line and 'xml:space="preserve"' in line:
+                            in_text = True
+                            current_text = line
+                        elif in_text:
+                            current_text += line
+                            if '</text>' in line:
+                                in_text = False
+                                # Extract and clean text
+                                text_match = re.search(r'<text[^>]*>(.*?)</text>', current_text, re.DOTALL)
+                                if text_match:
+                                    raw_text = text_match.group(1)
+                                    cleaned_text = clean_wikipedia_text(raw_text)
+                                    
+                                    if random.randint(0, 100) < 10:
+                                        continue
+                                    
+                                    if len(cleaned_text) < 100:
+                                        continue
+                                    
+                                    f.write(cleaned_text + "\n\n")
+                                    num_pages += 1
+                                    
+                                    current_size = os.path.getsize(output_filename)
+                                    if current_size >= TARGET_SIZE_BYTES:
+                                        print(f"\nTarget size reached: {current_size / (1024**3):.2f} GB.")
+                                        print(f"Total clean articles processed: {num_pages}")
+                                        return
+                                current_text = ""
+                
+                # Clean up downloaded file
+                os.remove(dump_file)
 
         print(f"Final data size: {os.path.getsize(output_filename) / (1024**3):.2f} GB in {output_filename}")
         print("Cleaning complete.")
