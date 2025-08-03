@@ -1545,11 +1545,16 @@ if __name__ == "__main__":
                     if param_name in onnx_weights:
                         checkpoint[param_name] = onnx_weights[param_name]
                     else:
-                        # Try common ONNX naming patterns
-                        for onnx_name in onnx_weights.keys():
-                            if param_name in onnx_name or onnx_name.endswith(param_name):
-                                checkpoint[param_name] = onnx_weights[onnx_name]
-                                break
+                        # Handle LoRALinear parameter mapping: .linear.weight -> .weight
+                        onnx_name_candidate = param_name.replace('.linear.', '.')
+                        if onnx_name_candidate in onnx_weights:
+                            checkpoint[param_name] = onnx_weights[onnx_name_candidate]
+                        else:
+                            # Try other common ONNX naming patterns
+                            for onnx_name in onnx_weights.keys():
+                                if param_name in onnx_name or onnx_name.endswith(param_name):
+                                    checkpoint[param_name] = onnx_weights[onnx_name]
+                                    break
                 
                 # If we still don't have all parameters, this might be architecture mismatch
                 if len(checkpoint) != len(current_state_dict):
@@ -1643,11 +1648,16 @@ if __name__ == "__main__":
                     if param_name in onnx_weights:
                         checkpoint[param_name] = onnx_weights[param_name]
                     else:
-                        # Try common ONNX naming patterns
-                        for onnx_name in onnx_weights.keys():
-                            if param_name in onnx_name or onnx_name.endswith(param_name):
-                                checkpoint[param_name] = onnx_weights[onnx_name]
-                                break
+                        # Handle LoRALinear parameter mapping: .linear.weight -> .weight
+                        onnx_name_candidate = param_name.replace('.linear.', '.')
+                        if onnx_name_candidate in onnx_weights:
+                            checkpoint[param_name] = onnx_weights[onnx_name_candidate]
+                        else:
+                            # Try other common ONNX naming patterns
+                            for onnx_name in onnx_weights.keys():
+                                if param_name in onnx_name or onnx_name.endswith(param_name):
+                                    checkpoint[param_name] = onnx_weights[onnx_name]
+                                    break
                 
                 # If we still don't have all parameters, this might be architecture mismatch
                 if len(checkpoint) != len(current_state_dict):
