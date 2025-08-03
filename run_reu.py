@@ -661,7 +661,7 @@ def test_model(model, dataloader, char_to_id, id_to_char, local_rank=0, is_distr
     """Evaluate model on test data and compute accuracy, loss, and confusion matrix"""
     model.eval()
     total_loss = 0.0
-    total_samples = 0
+    processed_samples = 0
     correct_predictions = 0
     
     # For confusion matrix - track predicted vs actual characters
@@ -695,9 +695,9 @@ def test_model(model, dataloader, char_to_id, id_to_char, local_rank=0, is_distr
                 predicted = torch.argmax(logits, dim=1)
                 
                 # Update metrics
-                batch_size = next_id.size(0)
-                total_loss += loss.item() * batch_size
-                total_samples += batch_size
+                current_batch_size = next_id.size(0)
+                total_loss += loss.item() * current_batch_size
+                processed_samples += current_batch_size
                 correct_predictions += (predicted == next_id).sum().item()
                 
                 # Update confusion matrix
@@ -707,7 +707,7 @@ def test_model(model, dataloader, char_to_id, id_to_char, local_rank=0, is_distr
                 # Update progress bar
                 if not is_distributed or local_rank == 0:
                     if isinstance(loop, tqdm):
-                        current_acc = correct_predictions / total_samples
+                        current_acc = correct_predictions / processed_samples
                         loop.set_postfix(loss=loss.item(), accuracy=f"{current_acc:.4f}")
                         
             except RuntimeError as e:
@@ -721,18 +721,18 @@ def test_model(model, dataloader, char_to_id, id_to_char, local_rank=0, is_distr
                     raise e
     
     # Calculate final metrics
-    avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
-    accuracy = correct_predictions / total_samples if total_samples > 0 else 0.0
+    avg_loss = total_loss / processed_samples if processed_samples > 0 else 0.0
+    accuracy = correct_predictions / processed_samples if processed_samples > 0 else 0.0
     
     # Print results (only on main process if distributed)
     if not is_distributed or local_rank == 0:
         print(f"\n{'='*60}")
         print(f"TEST RESULTS")
         print(f"{'='*60}")
-        print(f"Total samples: {total_samples:,}")
+        print(f"Total samples: {processed_samples:,}")
         print(f"Average loss: {avg_loss:.4f}")
         print(f"Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
-        print(f"Correct predictions: {correct_predictions:,}/{total_samples:,}")
+        print(f"Correct predictions: {correct_predictions:,}/{processed_samples:,}")
         
         # Print top confusions (most common misclassifications)
         print(f"\nTop 10 Character Confusions:")
@@ -761,7 +761,7 @@ def test_model(model, dataloader, char_to_id, id_to_char, local_rank=0, is_distr
     return {
         'loss': avg_loss,
         'accuracy': accuracy,
-        'total_samples': total_samples,
+        'total_samples': processed_samples,
         'correct_predictions': correct_predictions,
         'confusion_matrix': confusion_matrix
     }
